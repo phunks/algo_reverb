@@ -403,7 +403,6 @@ impl PluginEngine {
         reverb
             .set_band_damping(targets.damping_low, targets.damping_mid)
             .ok()?;
-        reverb.damping_amounts = reverb.target_damping_amounts;
         reverb
             .set_damping_shape(
                 targets.damping_low_hz,
@@ -412,15 +411,10 @@ impl PluginEngine {
             )
             .ok()?;
         reverb.set_diffusion(targets.diffusion).ok()?;
-        reverb.diffusion = targets.diffusion;
         reverb.set_loop_diffusion(targets.loop_diffusion).ok()?;
-        reverb.loop_diffusion = targets.loop_diffusion;
         reverb
             .set_delay_modulation(targets.delay_mode, targets.mod_depth, targets.mod_rate)
             .ok()?;
-        reverb.delay_weights = reverb.target_delay_weights;
-        reverb.mod_depth_ms = targets.mod_depth;
-        reverb.mod_rate_hz = targets.mod_rate;
         reverb.reset();
         Some(Self {
             reverb,
@@ -469,17 +463,6 @@ impl PluginEngine {
         self.reverb.reset();
         // Host reset restores the current parameter state without allocating or
         // carrying coefficient ramps over from the previous transport position.
-        self.reverb.matrix_weights = self.reverb.target_matrix_weights;
-        self.reverb.damping_coefficient = self.reverb.target_damping_coefficient;
-        self.reverb.damping_amounts = self.reverb.target_damping_amounts;
-        self.reverb.diffusion = self.reverb.target_diffusion;
-        self.reverb.loop_diffusion = self.reverb.target_loop_diffusion;
-        self.reverb.delay_weights = self.reverb.target_delay_weights;
-        self.reverb.mod_depth_ms = self.reverb.target_mod_depth_ms;
-        self.reverb.mod_rate_hz = self.reverb.target_mod_rate_hz;
-        for delay in &mut self.reverb.delays {
-            delay.gain = delay.target_gain;
-        }
         self.wet = params.wet.value();
         self.gain = util::db_to_gain(params.output_db.value());
         self.bypass = if params.bypass.value() { 1.0 } else { 0.0 };
@@ -808,7 +791,6 @@ impl ReverbEditor {
                 );
             });
         });
-        ui.label("8-line FDN · Householder -> Hadamard");
         ui.add_space(8.0);
         ui.separator();
         ui.horizontal(|ui| {
@@ -1282,8 +1264,8 @@ mod tests {
     #[test]
     fn output_range_and_default_support_fine_level_adjustments() {
         let params = ReverbParams::default();
-        assert_eq!(params.output_db.default_plain_value(), -6.0);
-        assert_eq!(params.output_db.value(), -6.0);
+        assert_eq!(params.output_db.default_plain_value(), 0.0);
+        assert_eq!(params.output_db.value(), 0.0);
         assert_eq!(params.output_db.preview_plain(0.0), -24.0);
         assert_eq!(params.output_db.preview_plain(1.0), 6.0);
         assert_eq!(params.output_db.preview_plain(0.5), -9.0);
@@ -1579,6 +1561,31 @@ mod tests {
             assert!(!names.is_empty(), "Missing fonts for {family:?}");
             for name in names {
                 assert!(!fonts.font_data[name].font.as_ref().as_ref().is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn default_engine_matches_classic_after_reset() {
+        let params = ReverbParams::default();
+        let mut engine = PluginEngine::new(48_000.0, &params).unwrap();
+        for _ in 0..2 {
+            engine.update(&params);
+            assert_eq!(params.t60.value(), 2.5);
+            assert_eq!(params.damping.value(), 6000.0);
+            engine.reset(&params);
+            let mut reference = Reverb::new(Config {
+                matrix: Matrix::Hybrid,
+                ..Config::default()
+            })
+            .unwrap();
+            reference.reset();
+            for i in 0..4096 {
+                let input = if i == 0 { 1.0 } else { 0.0 };
+                assert_eq!(
+                    engine.reverb.process_sample(input),
+                    reference.process_sample(input)
+                );
             }
         }
     }

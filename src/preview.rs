@@ -569,7 +569,7 @@ mod tests {
                 source.ticks = 0;
                 source.frame();
                 assert_eq!(
-                    source.reverb.target_damping_amounts,
+                    source.reverb.tank.target_damping_amounts,
                     [source.settings.damping_low, source.settings.damping_mid]
                         .map(|db| 1.0 - 10.0_f32.powf(-db / 20.0))
                 );

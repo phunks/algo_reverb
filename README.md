@@ -31,6 +31,24 @@ cargo run --release --features gui --bin reverb-lab
 
 Click **Open WAV…**, then **Play**. Start at a low volume.
 
+### Reverb engine
+
+The engine runs **one Classic eight-line FDN**, with the original 31–63 ms
+delay distribution, original diffusion, and no added early reflections.
+The experimental Room / Chamber / Plate banks and Character crossfade have
+been removed: no inactive tanks are allocated or processed.
+
+T60, Matrix, Damping, Input / Loop Diffusion, modulation, mix, output and ducking
+controls remain available as before. T60 is nominal: diffusion, damping and
+modulation also affect actual decay. Reset clears the single tank and immediately
+applies current target parameters. There are no independent Size or Pre-delay controls.
+
+The Character selector, its plugin parameter (`character`), and the fourth CLI
+argument have been removed. Old Room / Chamber / Plate settings and Character
+automation no longer reproduce those voicings; remaining plugin parameter IDs
+are unchanged. The Classic DSP response is preserved. The plugin Output default
+remains **0 dB**, with no limiter. Start with low listening volume.
+
 ### Damping
 
 All damping is inside the feedback loop, shortening the affected bands' tails

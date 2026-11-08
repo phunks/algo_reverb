@@ -7,7 +7,7 @@ use std::time::Instant;
 fn main() -> Result<(), Box<dyn Error>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.iter().any(|arg| arg == "--help" || arg == "-h") {
-        println!("Usage: algo_reverb [hadamard|householder|hybrid] [output.wav] [t60_seconds]");
+        println!("Usage: reverb-cli [hadamard|householder|hybrid] [output.wav] [t60_seconds]");
         println!("Renders a wet-only stereo impulse response at 48000 Hz (16-bit PCM).");
         return Ok(());
     }
@@ -32,6 +32,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         ..Config::default()
     };
     let mut reverb = Reverb::new(config)?;
+    reverb.reset();
     let frames = ((t60_seconds + 1.0) * config.sample_rate as f32).ceil() as u32;
     let data_bytes = frames * 4;
     // Do not silently overwrite an existing recording.
@@ -53,7 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     writer.flush()?;
     println!(
-        "Wrote {path}: {matrix:?}, {frames} stereo frames, peak {peak:.4}, clipped samples {clipped}"
+        "Wrote {path}: {matrix:?} / Classic, {frames} stereo frames, peak {peak:.4}, clipped samples {clipped}"
     );
     println!(
         "Render + PCM encoding + file writing: {:?} (not a DSP-only benchmark)",

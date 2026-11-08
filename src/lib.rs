@@ -2,6 +2,9 @@
 
 use std::fmt;
 
+mod reverb;
+pub use reverb::Reverb;
+
 #[cfg(feature = "gui")]
 pub mod preview;
 
@@ -68,14 +71,15 @@ impl Matrix {
 struct Allpass {
     buffer: Vec<f32>,
     position: usize,
+    coefficient: f32,
 }
 
 impl Allpass {
     fn process(&mut self, input: f32) -> f32 {
-        const G: f32 = 0.6;
+        let g = self.coefficient;
         let delayed = self.buffer[self.position];
-        let output = delayed - G * input;
-        self.buffer[self.position] = input + G * output;
+        let output = delayed - g * input;
+        self.buffer[self.position] = input + g * output;
         self.position = (self.position + 1) % self.buffer.len();
         output
     }
@@ -308,7 +312,7 @@ impl Delay {
 
 /// Mono input, wet-only stereo output. Construct outside the audio callback.
 /// Input samples must be finite; no limiting or dry mixing is performed here.
-pub struct Reverb {
+struct ReverbTank {
     delays: [Delay; CHANNELS],
     sample_rate: u32,
     matrix_weights: [f32; 3],
@@ -332,11 +336,11 @@ pub struct Reverb {
     target_mod_rate_hz: f32,
 }
 
-impl Reverb {
+impl ReverbTank {
     pub fn new(config: Config) -> Result<Self, ConfigError> {
         config.validate()?;
 
-        // Distinct prime lengths at 48 kHz, about 31 to 63 ms.
+        // Original Classic prime-length distribution at 48 kHz.
         let lengths = [1493, 1601, 1867, 2053, 2251, 2399, 2791, 3011];
         let delays = std::array::from_fn(|i| {
             let length =
@@ -376,6 +380,7 @@ impl Reverb {
                     (length as f64 * config.sample_rate as f64 / 48_000.0).round() as usize
                 ],
                 position: 0,
+                coefficient: 0.6,
             }),
             diffusion: 0.0,
             target_diffusion: 0.0,
@@ -385,6 +390,7 @@ impl Reverb {
                     (length as f64 * config.sample_rate as f64 / 48_000.0).round() as usize
                 ],
                 position: 0,
+                coefficient: 0.6,
             }),
             loop_diffusion: 0.0,
             target_loop_diffusion: 0.0,
@@ -666,6 +672,20 @@ impl Reverb {
         [output[0] * INV_SQRT_8, output[1] * INV_SQRT_8]
     }
 
+    fn snap_parameters(&mut self) {
+        self.matrix_weights = self.target_matrix_weights;
+        self.damping_coefficient = self.target_damping_coefficient;
+        self.damping_amounts = self.target_damping_amounts;
+        self.diffusion = self.target_diffusion;
+        self.loop_diffusion = self.target_loop_diffusion;
+        self.delay_weights = self.target_delay_weights;
+        self.mod_depth_ms = self.target_mod_depth_ms;
+        self.mod_rate_hz = self.target_mod_rate_hz;
+        for delay in &mut self.delays {
+            delay.gain = delay.target_gain;
+        }
+    }
+
     pub fn reset(&mut self) {
         for stage in self.diffusers.iter_mut().chain(&mut self.loop_diffusers) {
             stage.buffer.fill(0.0);
@@ -697,7 +717,7 @@ mod tests {
 
     #[test]
     fn live_parameters_validate_before_mutation_and_converge() {
-        let mut reverb = Reverb::new(Config::default()).unwrap();
+        let mut reverb = ReverbTank::new(Config::default()).unwrap();
         let previous = reverb.delays[0].target_gain;
         assert!(
             reverb
@@ -768,6 +788,7 @@ mod tests {
         let mut stage = Allpass {
             buffer: vec![0.0; 149],
             position: 0,
+            coefficient: 0.6,
         };
         let mut energy = 0.0_f64;
         for i in 0..20_000 {
@@ -785,8 +806,8 @@ mod tests {
                 t60_seconds: 0.3,
                 ..Config::default()
             };
-            let mut plain = Reverb::new(config).unwrap();
-            let mut diffuse = Reverb::new(config).unwrap();
+            let mut plain = ReverbTank::new(config).unwrap();
+            let mut diffuse = ReverbTank::new(config).unwrap();
             for invalid in [f32::NAN, -0.1, 1.1] {
                 assert!(diffuse.set_diffusion(invalid).is_err());
             }
@@ -818,8 +839,8 @@ mod tests {
 
     #[test]
     fn loop_diffusion_zero_preserves_original_path_and_validates_amount() {
-        let mut plain = Reverb::new(Config::default()).unwrap();
-        let mut bypassed = Reverb::new(Config::default()).unwrap();
+        let mut plain = ReverbTank::new(Config::default()).unwrap();
+        let mut bypassed = ReverbTank::new(Config::default()).unwrap();
         bypassed.set_loop_diffusion(0.5).unwrap();
         for invalid in [f32::NAN, f32::INFINITY, -0.1, 1.1] {
             assert!(bypassed.set_loop_diffusion(invalid).is_err());
@@ -857,8 +878,8 @@ mod tests {
                         t60_seconds: 0.3,
                         damping_hz: sample_rate as f32 * 0.125,
                     };
-                    let mut plain = Reverb::new(config).unwrap();
-                    let mut diffuse = Reverb::new(config).unwrap();
+                    let mut plain = ReverbTank::new(config).unwrap();
+                    let mut diffuse = ReverbTank::new(config).unwrap();
                     diffuse.set_loop_diffusion(amount).unwrap();
                     for _ in 0..sample_rate / 2 {
                         diffuse.process_sample(0.0);
@@ -902,7 +923,7 @@ mod tests {
 
     #[test]
     fn static_read_matches_original_integer_ring_and_zero_depth() {
-        let mut reverb = Reverb::new(Config::default()).unwrap();
+        let mut reverb = ReverbTank::new(Config::default()).unwrap();
         let delay = &mut reverb.delays[0];
         let mut original = vec![0.0; delay.length];
         let mut position = 0;
@@ -919,7 +940,7 @@ mod tests {
 
     #[test]
     fn modulation_validates_before_mutation() {
-        let mut reverb = Reverb::new(Config::default()).unwrap();
+        let mut reverb = ReverbTank::new(Config::default()).unwrap();
         for (depth, rate) in [
             (f32::NAN, 0.3),
             (-0.1, 0.3),
@@ -942,8 +963,8 @@ mod tests {
     #[test]
     fn zero_depth_modes_match_static_response() {
         for mode in [DelayMode::RandomLinear, DelayMode::RandomAllpass] {
-            let mut plain = Reverb::new(Config::default()).unwrap();
-            let mut modulated = Reverb::new(Config::default()).unwrap();
+            let mut plain = ReverbTank::new(Config::default()).unwrap();
+            let mut modulated = ReverbTank::new(Config::default()).unwrap();
             modulated.set_delay_modulation(mode, 0.0, 0.3).unwrap();
             modulated.mod_depth_ms = 0.0;
             modulated.delay_weights = mode.weights();
@@ -957,7 +978,7 @@ mod tests {
     #[test]
     fn allpass_random_modulation_remains_bounded_over_long_tail() {
         for matrix in MATRICES {
-            let mut reverb = Reverb::new(Config {
+            let mut reverb = ReverbTank::new(Config {
                 sample_rate: 8_000,
                 t60_seconds: 20.0,
                 damping_hz: 4_000.0,
@@ -995,8 +1016,8 @@ mod tests {
                         t60_seconds: 0.5,
                         damping_hz: sample_rate as f32 * 0.125,
                     };
-                    let mut reverb = Reverb::new(config).unwrap();
-                    let mut plain = Reverb::new(config).unwrap();
+                    let mut reverb = ReverbTank::new(config).unwrap();
+                    let mut plain = ReverbTank::new(config).unwrap();
                     reverb.set_delay_modulation(mode, 1.0, 2.0).unwrap();
                     reverb.delay_weights = mode.weights();
                     reverb.mod_depth_ms = 1.0;
@@ -1040,7 +1061,7 @@ mod tests {
     #[test]
     fn random_delay_switching_is_bounded_at_long_decay_and_extreme_rates() {
         for sample_rate in [8_000, 384_000] {
-            let mut reverb = Reverb::new(Config {
+            let mut reverb = ReverbTank::new(Config {
                 sample_rate,
                 t60_seconds: 20.0,
                 damping_hz: sample_rate as f32 * 0.5,
@@ -1108,7 +1129,7 @@ mod tests {
 
     #[test]
     fn band_damping_validates_atomically_and_zero_is_exact_bypass() {
-        let mut reverb = Reverb::new(Config::default()).unwrap();
+        let mut reverb = ReverbTank::new(Config::default()).unwrap();
         reverb.set_band_damping(6.0, 12.0).unwrap();
         let targets = reverb.target_damping_amounts;
         for (low, mid) in [
@@ -1129,7 +1150,7 @@ mod tests {
 
     #[test]
     fn damping_shape_validates_atomically_and_mid_q_controls_width() {
-        let mut reverb = Reverb::new(Config::default()).unwrap();
+        let mut reverb = ReverbTank::new(Config::default()).unwrap();
         reverb.set_damping_shape(500.0, 2000.0, 4.0).unwrap();
         let before = reverb.delays[0].mid_damping.target_a;
         for shape in [
@@ -1163,7 +1184,7 @@ mod tests {
     #[test]
     fn damping_shape_sweeps_stay_bounded_and_reset_restores_targets() {
         for rate in [8000, 48000, 384000] {
-            let mut reverb = Reverb::new(Config {
+            let mut reverb = ReverbTank::new(Config {
                 sample_rate: rate,
                 t60_seconds: 20.0,
                 damping_hz: rate as f32 * 0.45,
@@ -1201,8 +1222,8 @@ mod tests {
                 t60_seconds: 1.0,
                 ..Config::default()
             };
-            let mut reference = Reverb::new(config).unwrap();
-            let mut damped = Reverb::new(config).unwrap();
+            let mut reference = ReverbTank::new(config).unwrap();
+            let mut damped = ReverbTank::new(config).unwrap();
             damped.set_band_damping(12.0, 12.0).unwrap();
             damped.damping_amounts = damped.target_damping_amounts;
             let mut energy = [0.0_f64; 2];
@@ -1265,14 +1286,14 @@ mod tests {
                 ..Config::default()
             },
         ] {
-            assert!(Reverb::new(config).is_err());
+            assert!(ReverbTank::new(config).is_err());
         }
     }
 
     #[test]
     fn silence_and_reset_are_exact() {
         for matrix in MATRICES {
-            let mut reverb = Reverb::new(Config {
+            let mut reverb = ReverbTank::new(Config {
                 matrix,
                 ..Config::default()
             })
@@ -1285,7 +1306,7 @@ mod tests {
                 reverb.process_sample(0.0);
             }
             reverb.reset();
-            let mut fresh = Reverb::new(Config {
+            let mut fresh = ReverbTank::new(Config {
                 matrix,
                 ..Config::default()
             })
@@ -1301,7 +1322,7 @@ mod tests {
     fn impulse_is_finite_stereo_and_decays_at_multiple_sample_rates() {
         for matrix in MATRICES {
             for sample_rate in [8_000, 44_100, 48_000, 96_000] {
-                let mut reverb = Reverb::new(Config {
+                let mut reverb = ReverbTank::new(Config {
                     matrix,
                     sample_rate,
                     t60_seconds: 0.5,
