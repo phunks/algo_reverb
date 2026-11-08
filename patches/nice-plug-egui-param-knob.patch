@@ -1,0 +1,341 @@
+--- a/crates/nice-plug-egui/Cargo.toml
++++ b/crates/nice-plug-egui/Cargo.toml
+@@ -1,4 +1,5 @@
+ [package]
++workspace = "../.."
+ name = "nice-plug-egui"
+ version = "0.6.0"
+ authors = [
+@@ -22,7 +23,8 @@
+ 
+ [dependencies]
+ raw-window-handle.workspace = true
+-nice-plug-core = { path = "../nice-plug-core", version = "0.4.2" }
++nice-plug-core = { version = "0.4.2" }
++egui_knob = "0.6.3"
+ egui = { version = "0.37.0", default-features = false, features = ["bytemuck"] }
+ #egui-baseview = { git = "https://codeberg.org/RustAudio/egui-baseview.git", rev = "36444c18967f330effe3b7544da1f1797642b778", default-features = false, features = [
+ egui-baseview = { version = "0.9.0", default-features = false, features = [
+--- a/crates/nice-plug-egui/src/widgets.rs
++++ b/crates/nice-plug-egui/src/widgets.rs
+@@ -5,8 +5,20 @@
+ //! None of these widgets are finalized, and their sizes or looks can change at any point. Feel free
+ //! to copy the widgets and modify them to your personal taste.
+ 
++
++mod param_combo_box;
++mod param_enum_button;
++pub use param_combo_box::ParamComboBox;
++pub use param_enum_button::ParamEnumButton;
++
+ pub mod generic_ui;
++mod param_knob;
+ mod param_slider;
+ pub mod util;
+ 
++pub use egui_knob::KnobStyle;
++pub use param_knob::ParamKnob;
+ pub use param_slider::ParamSlider;
++
++mod param_button;
++pub use param_button::ParamButton;
+--- /dev/null
++++ b/crates/nice-plug-egui/src/widgets/param_knob.rs
+@@ -0,0 +1,118 @@
++use egui::{Response, Ui, Widget};
++use egui_knob::{Knob, KnobStyle};
++use nice_plug_core::{context::gui::ParamSetter, params::Param};
++
++/// An egui_knob widget connected to a nice-plug parameter.
++///
++/// Reads the parameter on every frame, including host automation. The knob works
++/// in normalized space so parameter skew, stepping, and units remain authoritative.
++/// Drag vertically to edit, hold Shift for fine adjustment, and double-click or
++/// control/command-click to reset. Scrolling is opt-in. Unlike ParamSlider, this
++/// widget does not currently support text entry.
++///
++/// Keep the widget present through the end of a drag so the host receives the
++/// corresponding end-gesture notification.
++#[must_use = "Add this widget with ui.add(widget)"]
++pub struct ParamKnob<'a, P: Param> {
++    param: &'a P,
++    setter: &'a ParamSetter<'a>,
++    size: f32,
++    style: KnobStyle,
++    draw_value: bool,
++    allow_scroll: bool,
++}
++
++impl<'a, P: Param> ParamKnob<'a, P> {
++    pub fn for_param(param: &'a P, setter: &'a ParamSetter<'a>) -> Self {
++        Self {
++            param,
++            setter,
++            size: 40.0,
++            style: KnobStyle::Wiper,
++            draw_value: true,
++            allow_scroll: false,
++        }
++    }
++
++    /// Set the knob diameter in logical pixels.
++    pub fn with_size(mut self, size: f32) -> Self {
++        if size.is_finite() && size > 0.0 {
++            self.size = size;
++        }
++        self
++    }
++
++    pub fn with_style(mut self, style: KnobStyle) -> Self {
++        self.style = style;
++        self
++    }
++
++    pub fn without_value(mut self) -> Self {
++        self.draw_value = false;
++        self
++    }
++
++    pub fn with_scroll(mut self, enabled: bool) -> Self {
++        self.allow_scroll = enabled;
++        self
++    }
++}
++
++impl<P: Param> Widget for ParamKnob<'_, P> {
++    fn ui(self, ui: &mut Ui) -> Response {
++        // Do not cache the parameter: the host can change it independently of us.
++        let mut normalized = self.param.modulated_normalized_value();
++        ui.vertical_centered(|ui| {
++            let sensitivity = if ui.input(|i| i.modifiers.shift) {
++                0.0005
++            } else {
++                0.005
++            };
++            let mut knob = Knob::new(&mut normalized, 0.0, 1.0, self.style)
++                .with_size(self.size)
++                .with_drag_sensitivity(sensitivity)
++                .with_double_click_reset(self.param.default_normalized_value());
++            if self.allow_scroll {
++                knob = knob.with_middle_scroll();
++            }
++            let mut response = ui.add(knob);
++            let gesture_id = response.id.with("param-knob-gesture");
++            let mut active = ui.data(|data| data.get_temp::<bool>(gesture_id).unwrap_or(false));
++            if response.is_pointer_button_down_on() && !active {
++                self.setter.begin_set_parameter(self.param);
++                active = true;
++            }
++
++            let reset = response.double_clicked()
++                || (response.clicked() && ui.input(|i| i.modifiers.ctrl || i.modifiers.command));
++            if reset || response.changed() {
++                let value = if reset {
++                    self.param.default_plain_value()
++                } else {
++                    // Snap discrete parameters before notifying the host.
++                    self.param.preview_plain(normalized)
++                };
++                if value != self.param.modulated_plain_value() {
++                    if !active {
++                        self.setter.begin_set_parameter(self.param);
++                    }
++                    self.setter.set_parameter(self.param, value);
++                    if !active {
++                        self.setter.end_set_parameter(self.param);
++                    }
++                    response.mark_changed();
++                }
++            }
++            if active && !response.is_pointer_button_down_on() {
++                self.setter.end_set_parameter(self.param);
++                active = false;
++            }
++            ui.data_mut(|data| data.insert_temp(gesture_id, active));
++            if self.draw_value {
++                ui.label(self.param.to_string());
++            }
++            response.on_hover_text(self.param.name())
++        })
++        .inner
++    }
++}
+--- /dev/null
++++ b/crates/nice-plug-egui/src/widgets/param_button.rs
+@@ -0,0 +1,48 @@
++use egui::{Button, Response, Ui, Widget, WidgetText};
++use nice_plug_core::{
++    context::gui::ParamSetter,
++    params::{BoolParam, Param},
++};
++
++/// A host-aware toggle button for a boolean parameter.
++///
++/// The selected state follows the parameter each frame, including host automation.
++/// Each activation flips the value and sends one complete host edit gesture.
++#[must_use = "Add this widget with ui.add(widget)"]
++pub struct ParamButton<'a> {
++    param: &'a BoolParam,
++    setter: &'a ParamSetter<'a>,
++    text: WidgetText,
++}
++
++impl<'a> ParamButton<'a> {
++    /// Create a toggle button using the parameter's name as its label.
++    pub fn for_param(param: &'a BoolParam, setter: &'a ParamSetter<'a>) -> Self {
++        Self {
++            param,
++            setter,
++            text: param.name().into(),
++        }
++    }
++
++    /// Override the button label without changing the parameter's name.
++    pub fn with_label(mut self, text: impl Into<WidgetText>) -> Self {
++        self.text = text.into();
++        self
++    }
++}
++
++impl Widget for ParamButton<'_> {
++    fn ui(self, ui: &mut Ui) -> Response {
++        let mut response =
++            ui.add(Button::new(self.text).selected(self.param.modulated_plain_value()));
++        if response.clicked() {
++            self.setter.begin_set_parameter(self.param);
++            self.setter
++                .set_parameter(self.param, !self.param.modulated_plain_value());
++            self.setter.end_set_parameter(self.param);
++            response.mark_changed();
++        }
++        response
++    }
++}
+--- /dev/null
++++ b/crates/nice-plug-egui/src/widgets/param_combo_box.rs
+@@ -0,0 +1,61 @@
++use egui::{ComboBox, Response, Ui, Widget};
++use nice_plug_core::{
++    context::gui::ParamSetter,
++    params::{EnumParam, Param, enums::Enum},
++};
++
++/// A host-aware combo box for an enum parameter.
++///
++/// Variant labels come from [`Enum::variants()`]. Selecting a different variant
++/// sends one complete host edit gesture. Host automation is read each frame.
++#[must_use = "Add this widget with ui.add(widget)"]
++pub struct ParamComboBox<'a, T: Enum + PartialEq> {
++    param: &'a EnumParam<T>,
++    setter: &'a ParamSetter<'a>,
++    width: Option<f32>,
++}
++
++impl<'a, T: Enum + PartialEq> ParamComboBox<'a, T> {
++    pub fn for_param(param: &'a EnumParam<T>, setter: &'a ParamSetter<'a>) -> Self {
++        Self {
++            param,
++            setter,
++            width: None,
++        }
++    }
++
++    pub fn with_width(mut self, width: f32) -> Self {
++        self.width = Some(width);
++        self
++    }
++}
++
++impl<T: Enum + PartialEq> Widget for ParamComboBox<'_, T> {
++    fn ui(self, ui: &mut Ui) -> Response {
++        let current = self.param.modulated_plain_value().to_index();
++        let mut combo =
++            ComboBox::from_id_salt(ui.next_auto_id()).selected_text(T::variants()[current]);
++        if let Some(width) = self.width {
++            combo = combo.width(width);
++        }
++        let mut changed = false;
++        let mut response = combo
++            .show_ui(ui, |ui| {
++                for (index, label) in T::variants().iter().enumerate() {
++                    if ui.selectable_label(index == current, *label).clicked()
++                        && self.param.modulated_plain_value().to_index() != index
++                    {
++                        self.setter.begin_set_parameter(self.param);
++                        self.setter.set_parameter(self.param, T::from_index(index));
++                        self.setter.end_set_parameter(self.param);
++                        changed = true;
++                    }
++                }
++            })
++            .response;
++        if changed {
++            response.mark_changed();
++        }
++        response
++    }
++}
+--- /dev/null
++++ b/crates/nice-plug-egui/src/widgets/param_enum_button.rs
+@@ -0,0 +1,61 @@
++use egui::{Button, Response, Ui, Widget};
++use nice_plug_core::{
++    context::gui::ParamSetter,
++    params::{EnumParam, Param, enums::Enum},
++};
++
++/// A host-aware button selecting one enum variant, suitable for a row of choices.
++/// Clicking the already selected variant does not send a redundant host edit.
++#[must_use = "Add this widget with ui.add(widget)"]
++pub struct ParamEnumButton<'a, T: Enum + PartialEq> {
++    param: &'a EnumParam<T>,
++    setter: &'a ParamSetter<'a>,
++    value: Option<T>,
++}
++
++impl<'a, T: Enum + PartialEq> ParamEnumButton<'a, T> {
++    pub fn for_param(param: &'a EnumParam<T>, setter: &'a ParamSetter<'a>, value: T) -> Self {
++        Self {
++            param,
++            setter,
++            value: Some(value),
++        }
++    }
++
++    /// Show the current variant and cycle to the next variant on activation.
++    /// For a two-variant enum this acts as a single toggle switch.
++    pub fn cycling(param: &'a EnumParam<T>, setter: &'a ParamSetter<'a>) -> Self {
++        Self {
++            param,
++            setter,
++            value: None,
++        }
++    }
++}
++
++impl<T: Enum + PartialEq> Widget for ParamEnumButton<'_, T> {
++    fn ui(self, ui: &mut Ui) -> Response {
++        let current = self.param.modulated_plain_value().to_index();
++        let cycling = self.value.is_none();
++        let index = self.value.map(Enum::to_index).unwrap_or(current);
++        let label = T::variants()[index];
++        let mut response = ui.add(Button::new(label).selected(if cycling {
++            current != 0
++        } else {
++            current == index
++        }));
++        let latest = self.param.modulated_plain_value().to_index();
++        let target = if cycling {
++            (latest + 1) % T::variants().len()
++        } else {
++            index
++        };
++        if response.clicked() && latest != target {
++            self.setter.begin_set_parameter(self.param);
++            self.setter.set_parameter(self.param, T::from_index(target));
++            self.setter.end_set_parameter(self.param);
++            response.mark_changed();
++        }
++        response
++    }
++}

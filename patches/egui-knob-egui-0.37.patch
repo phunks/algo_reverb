@@ -1,0 +1,14 @@
+diff --git a/Cargo.toml b/Cargo.toml
+index 229302f..4f9d23f 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -22,7 +22,7 @@ name = "example_knob"
+ path = "examples/example_knob.rs"
+ 
+ [dependencies]
+-egui = "0.36"
++egui = "0.37"
+ 
+ [dev-dependencies]
+-eframe = { version = "0.36", features = ["default_fonts"] }
++eframe = { version = "0.37", features = ["default_fonts"] }
