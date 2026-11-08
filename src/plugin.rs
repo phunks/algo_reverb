@@ -11,10 +11,26 @@ use nice_plug_core::context::gui::GuiContext;
 use nice_plug_egui::{
     EguiEditor, EguiEditorState, EguiNiceSettings, Frame, NiceEguiApp, RepaintNotifier,
     create_egui_editor,
-    widgets::{ParamButton, ParamComboBox, ParamEnumButton, ParamKnob},
+    widgets::{ParamButton, ParamComboBox, ParamEnumButton},
 };
 
 use crate::{Config, DelayMode, Matrix, Reverb};
+
+mod dual_knob;
+
+fn damping_frequency(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
+    FloatParam::new(
+        name,
+        default,
+        FloatRange::Skewed {
+            min,
+            max,
+            factor: FloatRange::skew_factor(-2.0),
+        },
+    )
+    .with_unit(" Hz")
+    .with_value_to_string(Arc::new(|value| format!("{value:.0}")))
+}
 
 #[derive(Enum, Clone, Copy, PartialEq, Eq)]
 enum DelayReadMode {
@@ -67,6 +83,65 @@ enum DuckSource {
     External,
 }
 
+#[derive(Enum, Clone, Copy, PartialEq, Eq)]
+enum DuckDetection {
+    #[id = "level"]
+    Level,
+    #[id = "transient"]
+    Transient,
+}
+
+/// Peak-envelope novelty detector. Its held target feeds the existing gain
+/// envelope, so Attack and Release retain their original time-constant meaning.
+#[derive(Default)]
+struct DuckTransient {
+    fast: f32,
+    slow: f32,
+    armed: bool,
+    remaining: u32,
+    held: f32,
+}
+
+impl DuckTransient {
+    fn detect(&mut self, level: f32, threshold: f32, amount: f32, timing: &DuckTiming) -> f32 {
+        self.fast = level.max(self.fast * (1.0 - timing.fast));
+        let novelty = (self.fast - self.slow).max(0.0);
+        // A relative floor rejects ordinary waveform ripple on sustained bass
+        // notes, even when the absolute Threshold is set very low.
+        let onset_threshold = threshold.max(self.slow * 0.5);
+        let slow_speed = if self.fast > self.slow {
+            timing.slow_attack
+        } else {
+            timing.slow_release
+        };
+        self.slow += slow_speed * (self.fast - self.slow);
+        if novelty < onset_threshold * 0.5 {
+            self.armed = true;
+        }
+        if self.armed && novelty > onset_threshold {
+            self.armed = false;
+            self.remaining = timing.hold;
+            self.held = 0.0;
+        }
+        if self.remaining > 0 {
+            self.held = self
+                .held
+                .max((20.0 * (novelty.max(1e-20) / threshold).log10()).clamp(0.0, amount));
+            self.remaining -= 1;
+            self.held.min(amount)
+        } else {
+            0.0
+        }
+    }
+}
+
+struct DuckTiming {
+    fast: f32,
+    slow_attack: f32,
+    slow_release: f32,
+    hold: u32,
+}
+
 #[derive(Params)]
 struct ReverbParams {
     #[id = "matrix"]
@@ -77,6 +152,10 @@ struct ReverbParams {
     t60: FloatParam,
     #[id = "damping"]
     damping: FloatParam,
+    #[id = "damping_low"]
+    damping_low: FloatParam,
+    #[id = "damping_mid"]
+    damping_mid: FloatParam,
     #[id = "wet"]
     wet: FloatParam,
     #[id = "output_db"]
@@ -103,12 +182,28 @@ struct ReverbParams {
     mod_depth: FloatParam,
     #[id = "mod_rate"]
     mod_rate: FloatParam,
+    #[id = "damping_low_hz"]
+    damping_low_hz: FloatParam,
+    #[id = "damping_mid_hz"]
+    damping_mid_hz: FloatParam,
+    #[id = "damping_mid_q"]
+    damping_mid_q: FloatParam,
+    #[id = "duck_detection"]
+    duck_detection: EnumParam<DuckDetection>,
 }
 
 impl Default for ReverbParams {
     fn default() -> Self {
         Self {
             matrix: EnumParam::new("Matrix", MatrixMode::Hybrid),
+            damping_low_hz: damping_frequency("Low Frequency", 250.0, 20.0, 2000.0),
+            damping_mid_hz: damping_frequency("Mid Frequency", 1000.0, 100.0, 12000.0),
+            damping_mid_q: FloatParam::new(
+                "Mid Q",
+                std::f32::consts::FRAC_1_SQRT_2,
+                FloatRange::Linear { min: 0.2, max: 8.0 },
+            )
+            .with_value_to_string(Arc::new(|value| format!("{value:.2}"))),
             delay_mode: EnumParam::new("Delay Mode", DelayReadMode::Static),
             mod_depth: FloatParam::new("Mod Depth", 0.2, FloatRange::Linear { min: 0.0, max: 1.0 })
                 .with_unit(" ms")
@@ -147,7 +242,7 @@ impl Default for ReverbParams {
             .with_unit(" s")
             .with_value_to_string(Arc::new(|value| format!("{value:.2}"))),
             damping: FloatParam::new(
-                "Damping",
+                "High Damping",
                 6000.0,
                 FloatRange::Skewed {
                     min: 100.0,
@@ -157,6 +252,26 @@ impl Default for ReverbParams {
             )
             .with_unit(" Hz")
             .with_value_to_string(Arc::new(|value| format!("{value:.0}"))),
+            damping_low: FloatParam::new(
+                "Low Damping",
+                0.0,
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 24.0,
+                },
+            )
+            .with_unit(" dB")
+            .with_value_to_string(Arc::new(|value| format!("{value:.1}"))),
+            damping_mid: FloatParam::new(
+                "Mid Damping",
+                0.0,
+                FloatRange::Linear {
+                    min: 0.0,
+                    max: 24.0,
+                },
+            )
+            .with_unit(" dB")
+            .with_value_to_string(Arc::new(|value| format!("{value:.1}"))),
             wet: FloatParam::new("Dry / Wet", 0.35, FloatRange::Linear { min: 0.0, max: 1.0 })
                 .with_value_to_string(Arc::new(|value| format!("{value:.2}"))),
             output_db: FloatParam::new(
@@ -172,6 +287,7 @@ impl Default for ReverbParams {
             bypass: BoolParam::new("Bypass", false).make_bypass(),
             duck_enabled: BoolParam::new("Ducking", false),
             duck_source: EnumParam::new("Source", DuckSource::Internal),
+            duck_detection: EnumParam::new("Ducking Detection", DuckDetection::Level),
             duck_threshold: FloatParam::new(
                 "Threshold",
                 -24.0,
@@ -222,6 +338,11 @@ impl Default for ReverbParams {
 struct Targets {
     t60: f32,
     damping: f32,
+    damping_low: f32,
+    damping_mid: f32,
+    damping_low_hz: f32,
+    damping_mid_hz: f32,
+    damping_mid_q: f32,
     matrix: Matrix,
     diffusion: f32,
     loop_diffusion: f32,
@@ -235,6 +356,11 @@ impl ReverbParams {
         Targets {
             t60: self.t60.value(),
             damping: self.damping.value().min(sample_rate as f32 * 0.5),
+            damping_low: self.damping_low.value(),
+            damping_mid: self.damping_mid.value(),
+            damping_low_hz: self.damping_low_hz.value(),
+            damping_mid_hz: self.damping_mid_hz.value(),
+            damping_mid_q: self.damping_mid_q.value(),
             matrix: self.matrix.value().into(),
             diffusion: self.diffusion.value(),
             loop_diffusion: self.loop_diffusion.value(),
@@ -254,6 +380,9 @@ struct PluginEngine {
     bypass: f32,
     smoothing: f32,
     duck_reduction: f32,
+    duck_transient: DuckTransient,
+    duck_detection: DuckDetection,
+    duck_source: DuckSource,
 }
 
 impl PluginEngine {
@@ -271,6 +400,17 @@ impl PluginEngine {
             matrix: targets.matrix,
         })
         .ok()?;
+        reverb
+            .set_band_damping(targets.damping_low, targets.damping_mid)
+            .ok()?;
+        reverb.damping_amounts = reverb.target_damping_amounts;
+        reverb
+            .set_damping_shape(
+                targets.damping_low_hz,
+                targets.damping_mid_hz,
+                targets.damping_mid_q,
+            )
+            .ok()?;
         reverb.set_diffusion(targets.diffusion).ok()?;
         reverb.diffusion = targets.diffusion;
         reverb.set_loop_diffusion(targets.loop_diffusion).ok()?;
@@ -291,6 +431,12 @@ impl PluginEngine {
             bypass: if params.bypass.value() { 1.0 } else { 0.0 },
             smoothing: 1.0 - (-1.0 / (0.01 * sample_rate as f32)).exp(),
             duck_reduction: 0.0,
+            duck_transient: DuckTransient {
+                armed: true,
+                ..Default::default()
+            },
+            duck_detection: params.duck_detection.value(),
+            duck_source: params.duck_source.value(),
         })
     }
 
@@ -302,7 +448,15 @@ impl PluginEngine {
                 .reverb
                 .set_parameters(next.t60, next.damping, next.matrix);
             let _ = self.reverb.set_diffusion(next.diffusion);
+            let _ = self
+                .reverb
+                .set_band_damping(next.damping_low, next.damping_mid);
             let _ = self.reverb.set_loop_diffusion(next.loop_diffusion);
+            let _ = self.reverb.set_damping_shape(
+                next.damping_low_hz,
+                next.damping_mid_hz,
+                next.damping_mid_q,
+            );
             let _ =
                 self.reverb
                     .set_delay_modulation(next.delay_mode, next.mod_depth, next.mod_rate);
@@ -317,6 +471,7 @@ impl PluginEngine {
         // carrying coefficient ramps over from the previous transport position.
         self.reverb.matrix_weights = self.reverb.target_matrix_weights;
         self.reverb.damping_coefficient = self.reverb.target_damping_coefficient;
+        self.reverb.damping_amounts = self.reverb.target_damping_amounts;
         self.reverb.diffusion = self.reverb.target_diffusion;
         self.reverb.loop_diffusion = self.reverb.target_loop_diffusion;
         self.reverb.delay_weights = self.reverb.target_delay_weights;
@@ -329,6 +484,10 @@ impl PluginEngine {
         self.gain = util::db_to_gain(params.output_db.value());
         self.bypass = if params.bypass.value() { 1.0 } else { 0.0 };
         self.duck_reduction = 0.0;
+        self.duck_transient = DuckTransient {
+            armed: true,
+            ..Default::default()
+        };
     }
 
     fn process(
@@ -345,6 +504,26 @@ impl PluginEngine {
         let coefficient = |ms: f32| 1.0 - (-1.0 / (0.001 * ms * self.sample_rate as f32)).exp();
         let attack = coefficient(params.duck_attack.value());
         let release = coefficient(params.duck_release.value());
+        let timing = DuckTiming {
+            fast: coefficient(30.0),
+            slow_attack: coefficient(30.0),
+            slow_release: coefficient(100.0),
+            // Three attack time constants give even slow attacks time to reach
+            // about 95% of the target. No extra user-facing Hold control.
+            hold: ((params.duck_attack.value() * 3.0).max(20.0) * 0.001 * self.sample_rate as f32)
+                .ceil() as u32,
+        };
+        let detection = params.duck_detection.value();
+        let source = params.duck_source.value();
+        if detection != self.duck_detection || source != self.duck_source {
+            self.duck_transient = DuckTransient {
+                armed: true,
+                ..Default::default()
+            };
+            self.duck_detection = detection;
+            self.duck_source = source;
+        }
+        let threshold = util::db_to_gain(params.duck_threshold.value());
         let sidechain = sidechain.map(Buffer::as_slice_immutable);
         for (index, mut frame) in buffer.iter_samples().enumerate() {
             // Reject invalid host samples before they can poison the feedback state.
@@ -366,11 +545,20 @@ impl PluginEngine {
                 }),
             };
             // One dB of reduction per dB above threshold, capped by Amount.
-            let target_reduction = if params.duck_enabled.value() {
+            let transient_target = self.duck_transient.detect(
+                detector,
+                threshold,
+                params.duck_amount.value(),
+                &timing,
+            );
+            let target_reduction = if !params.duck_enabled.value() {
+                self.duck_transient.remaining = 0;
+                0.0
+            } else if detection == DuckDetection::Transient {
+                transient_target
+            } else {
                 (20.0 * detector.max(1e-20).log10() - params.duck_threshold.value())
                     .clamp(0.0, params.duck_amount.value())
-            } else {
-                0.0
             };
             let speed = if target_reduction > self.duck_reduction {
                 attack
@@ -431,7 +619,7 @@ impl Plugin for AlgoReverb {
     fn editor(&mut self, _executor: AsyncExecutor<Self>) -> Option<Self::Editor> {
         create_egui_editor(
             EguiEditorState::from_size(
-                nice_plug_core::editor::dpi::LogicalSize::new(520.0, 700.0),
+                nice_plug_core::editor::dpi::LogicalSize::new(520.0, 800.0),
                 1.0,
             ),
             RepaintNotifier::new(),
@@ -515,6 +703,9 @@ fn knob_label(param: &FloatParam) -> &str {
     match param.name() {
         "Input diffusion" => "Diffusion",
         "Loop Diffusion" => "Loop Diff",
+        "High Damping" => "High Damp",
+        "Low Damping" => "Low Damp",
+        "Mid Damping" => "Mid Damp",
         name => name,
     }
 }
@@ -533,7 +724,7 @@ fn knob_row(ui: &mut egui::Ui, params: &[&FloatParam], setter: &ParamSetter<'_>)
                 |ui| {
                     ui.label(knob_label(param)).on_hover_text(param.name());
                     ui.add_space(4.0);
-                    ui.add(ParamKnob::for_param(*param, setter).with_size(48.0));
+                    dual_knob::single_knob(ui, param, setter);
                 },
             );
         }
@@ -624,9 +815,23 @@ impl ReverbEditor {
             ui.label("Matrix");
             ui.add(ParamComboBox::for_param(&self.params.matrix, &setter).with_width(260.0));
         });
-        let modulation = egui::CollapsingHeader::new("Delay Modulation")
-            .default_open(false)
-            .show(ui, |ui| {
+        // Reveal all controls immediately without asking the host to resize.
+        // Close this section to reach the bottom controls in the fixed window.
+        let modulation_id = ui.make_persistent_id("delay_modulation_open");
+        let mut expanded =
+            ui.data_mut(|data| data.get_temp::<bool>(modulation_id).unwrap_or(false));
+        let header = ui.horizontal(|ui| {
+            let arrow = ui.small_button(if expanded { "▾" } else { "▸" });
+            let label = ui.selectable_label(expanded, "Delay Modulation");
+            arrow.clicked() || label.clicked()
+        });
+        if header.inner {
+            expanded = !expanded;
+            ui.data_mut(|data| data.insert_temp(modulation_id, expanded));
+            ui.ctx().request_repaint();
+        }
+        if expanded {
+            ui.indent(modulation_id, |ui| {
                 ui.horizontal(|ui| {
                     ui.label("Delay");
                     ui.add(
@@ -640,33 +845,61 @@ impl ReverbEditor {
                     &setter,
                 );
             });
-        // Keep enough room throughout the collapse animation. Send only on a
-        // state change, rather than repeatedly asking a rejecting host to resize.
-        let expanded = modulation.body_returned.is_some();
-        let resize_id = ui.scope_id().with("modulation_window_expanded");
-        let previous = ui.data_mut(|data| {
-            let previous = data.get_temp::<bool>(resize_id);
-            data.insert_temp(resize_id, expanded);
-            previous
-        });
-        if previous != Some(expanded) {
-            ui.send_viewport_cmd(egui::ViewportCommand::InnerSize(egui::vec2(
-                520.0,
-                if expanded { 820.0 } else { 700.0 },
-            )));
         }
         for row in [
             &self.params.diffusion,
             &self.params.t60,
-            &self.params.damping,
+            &self.params.loop_diffusion,
             &self.params.wet,
             &self.params.output_db,
-            &self.params.loop_diffusion,
         ]
         .chunks(3)
         {
             knob_row(ui, row, &setter);
         }
+        ui.label("Damping · feedback attenuation");
+        let spacing = ui.spacing().item_spacing.x;
+        let width = ((ui.available_width() - spacing * 3.0) / 4.0).min(116.0);
+        ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+            for (amount, frequency) in [
+                (&self.params.damping_low, &self.params.damping_low_hz),
+                (&self.params.damping_mid, &self.params.damping_mid_hz),
+            ] {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, 0.0),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.label(knob_label(amount));
+                        ui.add_space(4.0);
+                        dual_knob::dual_knob(ui, amount, frequency, &setter);
+                        ui.small(format!(
+                            "{:.1} dB · {:.0} Hz",
+                            amount.value(),
+                            frequency.value()
+                        ));
+                    },
+                );
+            }
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, 0.0),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    ui.label("High Damp");
+                    ui.add_space(4.0);
+                    dual_knob::single_knob(ui, &self.params.damping, &setter);
+                },
+            );
+            ui.allocate_ui_with_layout(
+                egui::vec2(width, 0.0),
+                egui::Layout::top_down(egui::Align::Center),
+                |ui| {
+                    ui.label("Mid Q");
+                    ui.add_space(20.0);
+                    dual_knob::q_value(ui, &self.params.damping_mid_q, &setter);
+                },
+            );
+        });
+        ui.small("Low / Mid: left drag = dB · right drag = Hz · Shift = fine");
         ui.separator();
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -677,6 +910,8 @@ impl ReverbEditor {
             ui.add_space(12.0);
             ui.label("Source");
             ui.add(ParamEnumButton::cycling(&self.params.duck_source, &setter));
+            ui.add(ParamEnumButton::cycling(&self.params.duck_detection, &setter))
+                .on_hover_text("Level: follow loudness. Transient: duck on onsets, then recover during sustained notes. Threshold controls onset sensitivity; Attack/Release shape the reduction.");
         });
         ui.add_space(12.0);
         knob_row(
@@ -779,10 +1014,12 @@ mod tests {
             context: Some(GuiContext::new(Arc::new(LayoutHost))),
             held_peak: 0.0,
         };
-        let ctx = egui::Context::default();
-        for theme in [egui::Theme::Dark, egui::Theme::Light] {
-            ctx.style_mut_of(theme, |style| style.animation_time = 0.0);
+        if open_modulation {
+            // Exercise the longest ducking labels in the compact fixed window.
+            set(&editor.params.duck_detection, DuckDetection::Transient);
+            set(&editor.params.duck_source, DuckSource::External);
         }
+        let ctx = egui::Context::default();
         ctx.set_fonts(editor_fonts());
         for theme in [egui::Theme::Dark, egui::Theme::Light] {
             ctx.style_mut_of(theme, |style| {
@@ -792,14 +1029,12 @@ mod tests {
             });
         }
         let mut header_position = egui::Pos2::ZERO;
-        let mut window_size = egui::vec2(520.0, 700.0);
-        let mut requested_sizes = Vec::new();
+        let window_size = egui::vec2(520.0, 800.0);
         for frame in 0..9 {
-            let previous_window_size = window_size;
             let mut bounds = egui::Rect::NOTHING;
             let mut output = ctx.run_ui(
                 egui::RawInput {
-                    time: Some(frame as f64 * 0.1),
+                    time: Some(frame as f64 / 60.0),
                     events: if open_modulation && [1, 2, 5, 6].contains(&frame) {
                         vec![
                             egui::Event::PointerMoved(header_position),
@@ -823,17 +1058,13 @@ mod tests {
             );
             output.textures_delta.clear();
             for viewport in output.viewport_output.values() {
-                for command in &viewport.commands {
-                    if let egui::ViewportCommand::InnerSize(size) = command {
-                        requested_sizes.push(*size);
-                        window_size = *size;
-                    }
-                }
-            }
-            // The host applies a viewport resize after this frame. Expanded
-            // contents may be clipped until the following frame arrives.
-            if window_size != previous_window_size {
-                continue;
+                assert!(
+                    !viewport
+                        .commands
+                        .iter()
+                        .any(|command| matches!(command, egui::ViewportCommand::InnerSize(_))),
+                    "opening and closing modulation must never request a host resize"
+                );
             }
             let labels: Vec<_> = output
                 .shapes
@@ -848,17 +1079,39 @@ mod tests {
                 .find(|text| text.galley.job.text == "Delay Modulation")
                 .expect("modulation header must remain visible");
             header_position = header.pos + header.galley.size() * 0.5;
-            if frame == 0 || frame == 4 || frame == 8 {
+            let expanded = open_modulation && (2..6).contains(&frame);
+            {
                 assert_eq!(
                     labels
                         .iter()
                         .any(|text| text.galley.job.text == "Mod Depth"),
-                    open_modulation && frame == 4
+                    expanded
                 );
                 assert_eq!(
                     labels.iter().any(|text| text.galley.job.text == "Mod Rate"),
-                    open_modulation && frame == 4
+                    expanded
                 );
+                for text in labels.iter().filter(|text| {
+                    matches!(
+                        text.galley.job.text.as_str(),
+                        "Delay" | "Mod Depth" | "Mod Rate"
+                    )
+                }) {
+                    let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                    assert!(
+                        output.shapes.iter().any(|shape| {
+                            matches!(&shape.shape, egui::epaint::Shape::Text(candidate)
+                                if std::ptr::eq(candidate, *text))
+                                && shape.clip_rect.contains_rect(rect)
+                        }),
+                        "modulation controls must be fully visible in the click frame"
+                    );
+                }
+            }
+            assert!(bounds.right() <= window_size.x, "{bounds:?}");
+            if expanded {
+                // The lower controls may be clipped until modulation is closed.
+                continue;
             }
             let peak_label = output
                 .shapes
@@ -884,18 +1137,6 @@ mod tests {
                 "{bounds:?}"
             );
         }
-        assert_eq!(
-            requested_sizes,
-            if open_modulation {
-                vec![
-                    egui::vec2(520.0, 700.0),
-                    egui::vec2(520.0, 820.0),
-                    egui::vec2(520.0, 700.0),
-                ]
-            } else {
-                vec![egui::vec2(520.0, 700.0)]
-            }
-        );
     }
 
     #[test]
@@ -968,23 +1209,27 @@ mod tests {
                         .shapes
                         .iter()
                         .filter_map(|shape| match &shape.shape {
-                            egui::epaint::Shape::Circle(circle) if circle.radius > 20.0 => {
-                                Some(circle)
+                            egui::epaint::Shape::Path(path) if path.points.len() == 49 => {
+                                Some(path.visual_bounding_rect())
                             }
                             _ => None,
                         })
                         .collect();
-                    assert!(!knobs.is_empty(), "expected visible knobs");
+                    assert_eq!(
+                        knobs.len(),
+                        row.len() * 2,
+                        "background and value arcs per knob"
+                    );
                     for knob in knobs {
                         let label = labels
                             .iter()
                             .min_by(|a, b| {
-                                (a.center().x - knob.center.x)
+                                (a.center().x - knob.center().x)
                                     .abs()
-                                    .total_cmp(&(b.center().x - knob.center.x).abs())
+                                    .total_cmp(&(b.center().x - knob.center().x).abs())
                             })
                             .unwrap();
-                        let gap = knob.center.y - knob.radius - label.bottom();
+                        let gap = knob.top() - label.bottom();
                         assert!(gap >= 4.0, "label is too close to knob: {gap}");
                     }
                     for label in &labels {
@@ -1013,7 +1258,9 @@ mod tests {
         assert_eq!(params.diffusion.name(), "Input diffusion");
         assert_eq!(knob_label(&params.loop_diffusion), "Loop Diff");
         assert_eq!(params.loop_diffusion.name(), "Loop Diffusion");
-        assert_eq!(knob_label(&params.damping), "Damping");
+        assert_eq!(knob_label(&params.damping), "High Damp");
+        assert_eq!(knob_label(&params.damping_low), "Low Damp");
+        assert_eq!(knob_label(&params.damping_mid), "Mid Damp");
     }
 
     #[test]
@@ -1146,9 +1393,15 @@ mod tests {
 
     #[test]
     fn external_ducking_is_block_independent_and_sanitizes_trigger() {
+        assert_external_ducking_is_block_independent(DuckDetection::Level);
+        assert_external_ducking_is_block_independent(DuckDetection::Transient);
+    }
+
+    fn assert_external_ducking_is_block_independent(detection: DuckDetection) {
         let params = ReverbParams::default();
         set(&params.duck_enabled, true);
         set(&params.duck_source, DuckSource::External);
+        set(&params.duck_detection, detection);
         let mut a = PluginEngine::new(48000.0, &params).unwrap();
         let mut b = PluginEngine::new(48000.0, &params).unwrap();
         let mut l = vec![0.1; 8192];
@@ -1181,6 +1434,125 @@ mod tests {
         assert_eq!((l, r), (bl, br));
         assert_eq!(a.duck_reduction, b.duck_reduction);
         assert!(a.duck_reduction.is_finite());
+    }
+
+    fn duck_constant(engine: &mut PluginEngine, params: &ReverbParams, value: f32, ms: f32) {
+        let count = (ms * 0.001 * engine.sample_rate as f32).round() as usize;
+        process(
+            engine,
+            params,
+            &mut vec![value; count],
+            &mut vec![-value; count],
+        );
+    }
+
+    #[test]
+    fn transient_ducking_recovers_on_sustain_and_retriggers_at_multiple_rates() {
+        for rate in [44100.0, 48000.0, 96000.0] {
+            let params = ReverbParams::default();
+            set(&params.duck_enabled, true);
+            set(&params.duck_detection, DuckDetection::Transient);
+            set(&params.duck_release, 50.0);
+            let mut engine = PluginEngine::new(rate, &params).unwrap();
+            duck_constant(&mut engine, &params, 1.0, 10.0);
+            assert!((engine.duck_reduction - 12.0 * (1.0 - (-1.0_f32).exp())).abs() < 0.02);
+            duck_constant(&mut engine, &params, 1.0, 20.0);
+            assert!(engine.duck_reduction > 11.3);
+            duck_constant(&mut engine, &params, 1.0, 700.0);
+            assert!(
+                engine.duck_reduction < 0.001,
+                "sustain must not hold reduction"
+            );
+            duck_constant(&mut engine, &params, 2.0, 10.0);
+            assert!(
+                engine.duck_reduction > 7.0,
+                "a new onset over sustain must retrigger"
+            );
+            engine.reset(&params);
+            assert_eq!(engine.duck_transient.remaining, 0);
+            assert_eq!(engine.duck_transient.fast, 0.0);
+            assert_eq!(engine.duck_reduction, 0.0);
+            duck_constant(&mut engine, &params, 1.0, 10.0);
+            assert!(engine.duck_reduction > 7.0);
+        }
+    }
+
+    #[test]
+    fn transient_attack_hold_release_threshold_and_amount_remain_effective() {
+        let params = ReverbParams::default();
+        set(&params.duck_enabled, true);
+        set(&params.duck_detection, DuckDetection::Transient);
+        set(&params.duck_attack, 200.0);
+        set(&params.duck_release, 100.0);
+        set(&params.duck_amount, 6.0);
+        let mut engine = PluginEngine::new(48000.0, &params).unwrap();
+        duck_constant(&mut engine, &params, 1.0, 10.0);
+        assert!(engine.duck_reduction > 0.2 && engine.duck_reduction < 0.4);
+        duck_constant(&mut engine, &params, 1.0, 590.0);
+        assert!((engine.duck_reduction - 6.0 * (1.0 - (-3.0_f32).exp())).abs() < 0.01);
+        let before = engine.duck_reduction;
+        duck_constant(&mut engine, &params, 1.0, 100.0);
+        assert!((engine.duck_reduction - before * (-1.0_f32).exp()).abs() < 0.01);
+        engine.reset(&params);
+        duck_constant(&mut engine, &params, 0.01, 100.0);
+        assert_eq!(
+            engine.duck_reduction, 0.0,
+            "below-threshold onset must be ignored"
+        );
+        set(&params.duck_amount, 0.0);
+        duck_constant(&mut engine, &params, 1.0, 100.0);
+        assert_eq!(engine.duck_reduction, 0.0);
+        set(&params.duck_amount, 6.0);
+        set(&params.duck_source, DuckSource::External);
+        duck_constant(&mut engine, &params, 1.0, 100.0);
+        assert_eq!(
+            engine.duck_reduction, 0.0,
+            "missing external input must not use internal audio"
+        );
+    }
+
+    #[test]
+    fn transient_detector_does_not_retrigger_on_a_steady_tone() {
+        let params = ReverbParams::default();
+        set(&params.duck_enabled, true);
+        set(&params.duck_detection, DuckDetection::Transient);
+        set(&params.duck_release, 10.0);
+        for hz in [40.0, 1000.0, 10000.0] {
+            let mut engine = PluginEngine::new(48000.0, &params).unwrap();
+            let mut left: Vec<_> = (0..48000)
+                .map(|i| (std::f32::consts::TAU * hz * i as f32 / 48000.0).sin())
+                .collect();
+            let mut right = left.iter().map(|v| -v).collect::<Vec<_>>();
+            process(&mut engine, &params, &mut left, &mut right);
+            assert!(engine.duck_reduction < 0.001, "steady {hz} Hz must settle");
+        }
+    }
+
+    #[test]
+    fn transient_disabled_and_mode_changes_do_not_replay_a_held_trigger() {
+        let params = ReverbParams::default();
+        set(&params.duck_detection, DuckDetection::Transient);
+        let mut engine = PluginEngine::new(48000.0, &params).unwrap();
+        duck_constant(&mut engine, &params, 1.0, 100.0);
+        assert_eq!(engine.duck_reduction, 0.0);
+        set(&params.duck_enabled, true);
+        duck_constant(&mut engine, &params, 1.0, 100.0);
+        assert_eq!(
+            engine.duck_reduction, 0.0,
+            "enabling during sustain must not replay an onset"
+        );
+        duck_constant(&mut engine, &params, 2.0, 10.0);
+        assert!(engine.duck_reduction > 7.0);
+        set(&params.duck_detection, DuckDetection::Level);
+        set(&params.duck_source, DuckSource::External);
+        let before = engine.duck_reduction;
+        duck_constant(&mut engine, &params, 1.0, 10.0);
+        assert!(engine.duck_reduction < before);
+        assert_eq!(engine.duck_transient.remaining, 0);
+        set(&params.duck_detection, DuckDetection::Transient);
+        let before = engine.duck_reduction;
+        duck_constant(&mut engine, &params, 1.0, 10.0);
+        assert!(engine.duck_reduction < before);
     }
 
     #[test]
@@ -1226,6 +1598,8 @@ mod tests {
                 "diffusion",
                 "t60",
                 "damping",
+                "damping_low",
+                "damping_mid",
                 "wet",
                 "output_db",
                 "bypass",
@@ -1238,7 +1612,11 @@ mod tests {
                 "loop_diffusion",
                 "delay_mode",
                 "mod_depth",
-                "mod_rate"
+                "mod_rate",
+                "damping_low_hz",
+                "damping_mid_hz",
+                "damping_mid_q",
+                "duck_detection"
             ]
         );
         assert!(params.matrix.value() == MatrixMode::Hybrid);
@@ -1255,6 +1633,8 @@ mod tests {
         assert_eq!(params.loop_diffusion.default_plain_value(), 0.0);
         assert_eq!(params.loop_diffusion.value(), 0.0);
         assert!(params.duck_source.value() == DuckSource::Internal);
+        assert!(params.duck_detection.value() == DuckDetection::Level);
+        assert_eq!(DuckDetection::ids().unwrap(), ["level", "transient"]);
         assert_eq!(DuckSource::ids().unwrap(), ["internal", "external"]);
         assert_eq!(
             AlgoReverb::AUDIO_IO_LAYOUTS[0].aux_input_ports,
@@ -1336,6 +1716,17 @@ mod tests {
             for i in 0..100 {
                 set(&params.matrix, MatrixMode::from_index(i % 3));
                 set(&params.damping, if i % 2 == 0 { 20000.0 } else { 100.0 });
+                set(&params.damping_low, if i % 2 == 0 { 24.0 } else { 0.0 });
+                set(&params.damping_mid, if i % 3 == 0 { 24.0 } else { 0.0 });
+                set(
+                    &params.damping_low_hz,
+                    if i % 2 == 0 { 20.0 } else { 2000.0 },
+                );
+                set(
+                    &params.damping_mid_hz,
+                    if i % 2 == 0 { 12000.0 } else { 100.0 },
+                );
+                set(&params.damping_mid_q, if i % 2 == 0 { 8.0 } else { 0.2 });
                 set(&params.t60, if i % 2 == 0 { 20.0 } else { 0.1 });
                 set(&params.diffusion, (i % 2) as f32);
                 set(&params.loop_diffusion, (i % 2) as f32);

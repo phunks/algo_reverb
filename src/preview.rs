@@ -96,6 +96,11 @@ pub fn load_wav(path: &Path) -> Result<Clip, String> {
 pub struct Settings {
     pub t60: f32,
     pub damping: f32,
+    pub damping_low: f32,
+    pub damping_mid: f32,
+    pub damping_low_hz: f32,
+    pub damping_mid_hz: f32,
+    pub damping_mid_q: f32,
     pub diffusion: f32,
     pub wet: f32,
     pub gain_db: f32,
@@ -108,6 +113,11 @@ impl Default for Settings {
         Self {
             t60: 2.5,
             damping: 6_000.0,
+            damping_low: 0.0,
+            damping_mid: 0.0,
+            damping_low_hz: 250.0,
+            damping_mid_hz: 1000.0,
+            damping_mid_q: std::f32::consts::FRAC_1_SQRT_2,
             diffusion: 0.0,
             wet: 0.35,
             gain_db: -12.0,
@@ -122,6 +132,11 @@ impl Default for Settings {
 pub struct Controls {
     t60: AtomicU32,
     damping: AtomicU32,
+    damping_low: AtomicU32,
+    damping_mid: AtomicU32,
+    damping_low_hz: AtomicU32,
+    damping_mid_hz: AtomicU32,
+    damping_mid_q: AtomicU32,
     diffusion: AtomicU32,
     wet: AtomicU32,
     gain_db: AtomicU32,
@@ -141,6 +156,11 @@ impl Default for Controls {
         Self {
             t60: AtomicU32::new(s.t60.to_bits()),
             damping: AtomicU32::new(s.damping.to_bits()),
+            damping_low: AtomicU32::new(s.damping_low.to_bits()),
+            damping_mid: AtomicU32::new(s.damping_mid.to_bits()),
+            damping_low_hz: AtomicU32::new(s.damping_low_hz.to_bits()),
+            damping_mid_hz: AtomicU32::new(s.damping_mid_hz.to_bits()),
+            damping_mid_q: AtomicU32::new(s.damping_mid_q.to_bits()),
             diffusion: AtomicU32::new(s.diffusion.to_bits()),
             wet: AtomicU32::new(s.wet.to_bits()),
             gain_db: AtomicU32::new(s.gain_db.to_bits()),
@@ -174,6 +194,32 @@ impl Controls {
             finite(settings.damping, 6000.0, 100.0, 20_000.0).to_bits(),
             Ordering::Relaxed,
         );
+        self.damping_low.store(
+            finite(settings.damping_low, 0.0, 0.0, 24.0).to_bits(),
+            Ordering::Relaxed,
+        );
+        self.damping_mid.store(
+            finite(settings.damping_mid, 0.0, 0.0, 24.0).to_bits(),
+            Ordering::Relaxed,
+        );
+        self.damping_low_hz.store(
+            finite(settings.damping_low_hz, 250.0, 20.0, 2000.0).to_bits(),
+            Ordering::Relaxed,
+        );
+        self.damping_mid_hz.store(
+            finite(settings.damping_mid_hz, 1000.0, 100.0, 12000.0).to_bits(),
+            Ordering::Relaxed,
+        );
+        self.damping_mid_q.store(
+            finite(
+                settings.damping_mid_q,
+                std::f32::consts::FRAC_1_SQRT_2,
+                0.2,
+                8.0,
+            )
+            .to_bits(),
+            Ordering::Relaxed,
+        );
         self.wet.store(
             finite(settings.wet, 0.35, 0.0, 1.0).to_bits(),
             Ordering::Relaxed,
@@ -201,6 +247,11 @@ impl Controls {
         Settings {
             t60: f32::from_bits(self.t60.load(Ordering::Relaxed)),
             damping: f32::from_bits(self.damping.load(Ordering::Relaxed)),
+            damping_low: f32::from_bits(self.damping_low.load(Ordering::Relaxed)),
+            damping_mid: f32::from_bits(self.damping_mid.load(Ordering::Relaxed)),
+            damping_low_hz: f32::from_bits(self.damping_low_hz.load(Ordering::Relaxed)),
+            damping_mid_hz: f32::from_bits(self.damping_mid_hz.load(Ordering::Relaxed)),
+            damping_mid_q: f32::from_bits(self.damping_mid_q.load(Ordering::Relaxed)),
             diffusion: f32::from_bits(self.diffusion.load(Ordering::Relaxed)),
             wet: f32::from_bits(self.wet.load(Ordering::Relaxed)),
             gain_db: f32::from_bits(self.gain_db.load(Ordering::Relaxed)),
@@ -243,6 +294,13 @@ impl PreviewSource {
         })
         .unwrap();
         let _ = reverb.set_diffusion(settings.diffusion);
+        let _ = reverb.set_band_damping(settings.damping_low, settings.damping_mid);
+        let _ = reverb.set_damping_shape(
+            settings.damping_low_hz,
+            settings.damping_mid_hz,
+            settings.damping_mid_q,
+        );
+        reverb.reset();
         Self {
             clip,
             controls,
@@ -275,6 +333,23 @@ impl PreviewSource {
                 let _ = self
                     .reverb
                     .set_parameters(next.t60, next.damping, next.matrix);
+            }
+            if next.damping_low != self.settings.damping_low
+                || next.damping_mid != self.settings.damping_mid
+            {
+                let _ = self
+                    .reverb
+                    .set_band_damping(next.damping_low, next.damping_mid);
+            }
+            if next.damping_low_hz != self.settings.damping_low_hz
+                || next.damping_mid_hz != self.settings.damping_mid_hz
+                || next.damping_mid_q != self.settings.damping_mid_q
+            {
+                let _ = self.reverb.set_damping_shape(
+                    next.damping_low_hz,
+                    next.damping_mid_hz,
+                    next.damping_mid_q,
+                );
             }
             self.settings = next;
             self.target_gain = 10.0_f32.powf(next.gain_db / 20.0);
@@ -438,6 +513,11 @@ mod tests {
         controls.publish(Settings {
             t60: f32::NAN,
             damping: f32::INFINITY,
+            damping_low: f32::NAN,
+            damping_mid: 100.0,
+            damping_low_hz: f32::INFINITY,
+            damping_mid_hz: 50000.0,
+            damping_mid_q: -1.0,
             wet: -1.0,
             gain_db: 100.0,
             ..Settings::default()
@@ -445,6 +525,11 @@ mod tests {
         let settings = controls.settings();
         assert_eq!(settings.t60, 2.5);
         assert_eq!(settings.damping, 6000.0);
+        assert_eq!(settings.damping_low, 0.0);
+        assert_eq!(settings.damping_mid, 24.0);
+        assert_eq!(settings.damping_low_hz, 250.0);
+        assert_eq!(settings.damping_mid_hz, 12000.0);
+        assert_eq!(settings.damping_mid_q, 0.2);
         assert_eq!(settings.wet, 0.0);
         assert_eq!(settings.gain_db, 0.0);
     }
@@ -474,8 +559,20 @@ mod tests {
                     },
                     diffusion: (i % 7) as f32 / 6.0,
                     t60: 0.2 + (i % 10) as f32,
+                    damping_low: (i % 25) as f32,
+                    damping_mid: (i % 13) as f32,
+                    damping_low_hz: 20.0 + (i % 1981) as f32,
+                    damping_mid_hz: 100.0 + (i % 11901) as f32,
+                    damping_mid_q: 0.2 + (i % 78) as f32 / 10.0,
                     ..Settings::default()
                 });
+                source.ticks = 0;
+                source.frame();
+                assert_eq!(
+                    source.reverb.target_damping_amounts,
+                    [source.settings.damping_low, source.settings.damping_mid]
+                        .map(|db| 1.0 - 10.0_f32.powf(-db / 20.0))
+                );
             }
             let sample = source.next().unwrap();
             assert!(sample.is_finite() && sample.abs() <= 1.0);

@@ -151,6 +151,89 @@ impl DelayMode {
     }
 }
 
+/// Passive damping branches: first-order LP and constant-peak band-pass.
+/// Subtracting either branch
+/// with an amount in [0, 1] never boosts its steady-state frequency response.
+struct DampingBranch {
+    b: [f32; 3],
+    a: [f32; 2],
+    state: [f32; 2],
+    target_b: [f32; 3],
+    target_a: [f32; 2],
+    smoothing: f32,
+}
+
+impl DampingBranch {
+    fn low(sample_rate: u32) -> Self {
+        Self::low_at(sample_rate, 250.0)
+    }
+
+    fn low_at(sample_rate: u32, hz: f32) -> Self {
+        let k = (std::f32::consts::PI * hz / sample_rate as f32).tan();
+        let b = k / (1.0 + k);
+        Self {
+            b: [b, b, 0.0],
+            a: [(k - 1.0) / (k + 1.0), 0.0],
+            state: [0.0; 2],
+            target_b: [b, b, 0.0],
+            target_a: [(k - 1.0) / (k + 1.0), 0.0],
+            smoothing: 1.0 - (-1.0 / (0.02 * sample_rate as f32)).exp(),
+        }
+    }
+
+    fn mid(sample_rate: u32) -> Self {
+        Self::mid_at(sample_rate, 1000.0, std::f32::consts::FRAC_1_SQRT_2)
+    }
+
+    fn mid_at(sample_rate: u32, hz: f32, q: f32) -> Self {
+        let w = std::f32::consts::TAU * hz / sample_rate as f32;
+        let alpha = w.sin() / (2.0 * q);
+        let norm = 1.0 / (1.0 + alpha);
+        Self {
+            b: [alpha * norm, 0.0, -alpha * norm],
+            a: [-2.0 * w.cos() * norm, (1.0 - alpha) * norm],
+            state: [0.0; 2],
+            target_b: [alpha * norm, 0.0, -alpha * norm],
+            target_a: [-2.0 * w.cos() * norm, (1.0 - alpha) * norm],
+            smoothing: 1.0 - (-1.0 / (0.02 * sample_rate as f32)).exp(),
+        }
+    }
+
+    fn target(&mut self, filter: Self) {
+        self.target_b = filter.b;
+        self.target_a = filter.a;
+    }
+
+    fn reset(&mut self) {
+        self.state = [0.0; 2];
+        self.b = self.target_b;
+        self.a = self.target_a;
+    }
+
+    fn process(&mut self, input: f32, amount: f32) -> f32 {
+        for (coefficient, target) in self.b.iter_mut().zip(self.target_b) {
+            *coefficient += self.smoothing * (target - *coefficient);
+        }
+        for (coefficient, target) in self.a.iter_mut().zip(self.target_a) {
+            *coefficient += self.smoothing * (target - *coefficient);
+        }
+        let branch = self.b[0] * input + self.state[0];
+        self.state[0] = self.b[1] * input - self.a[0] * branch + self.state[1];
+        self.state[1] = self.b[2] * input - self.a[1] * branch;
+        for state in &mut self.state {
+            if state.abs() < 1e-20 {
+                *state = 0.0;
+            }
+        }
+        // Warm history even when off; preserve the original sample bit-for-bit.
+        if amount == 0.0 {
+            input
+        } else {
+            input - amount * branch
+        }
+    }
+}
+
 struct Delay {
     buffer: Vec<f32>,
     length: usize,
@@ -158,6 +241,8 @@ struct Delay {
     gain: f32,
     target_gain: f32,
     lowpass: f32,
+    low_damping: DampingBranch,
+    mid_damping: DampingBranch,
     seed: u32,
     random: u32,
     random_target: f32,
@@ -236,6 +321,8 @@ pub struct Reverb {
     target_diffusion: f32,
     damping_coefficient: f32,
     target_damping_coefficient: f32,
+    damping_amounts: [f32; 2],
+    target_damping_amounts: [f32; 2],
     smoothing: f32,
     delay_weights: [f32; 3],
     target_delay_weights: [f32; 3],
@@ -262,6 +349,8 @@ impl Reverb {
                 gain: 10.0_f32.powf(-3.0 * seconds / config.t60_seconds),
                 target_gain: 10.0_f32.powf(-3.0 * seconds / config.t60_seconds),
                 lowpass: 0.0,
+                low_damping: DampingBranch::low(config.sample_rate),
+                mid_damping: DampingBranch::mid(config.sample_rate),
                 seed: 0x9e37_79b9_u32.wrapping_mul(i as u32 + 1),
                 random: 0x9e37_79b9_u32.wrapping_mul(i as u32 + 1),
                 random_target: 0.0,
@@ -301,6 +390,8 @@ impl Reverb {
             target_loop_diffusion: 0.0,
             damping_coefficient,
             target_damping_coefficient: damping_coefficient,
+            damping_amounts: [0.0; 2],
+            target_damping_amounts: [0.0; 2],
             smoothing: 1.0 - (-1.0 / (0.02 * config.sample_rate as f32)).exp(),
             delay_weights: DelayMode::Static.weights(),
             target_delay_weights: DelayMode::Static.weights(),
@@ -365,6 +456,56 @@ impl Reverb {
         Ok(())
     }
 
+    /// Additional feedback attenuation in dB (0..24). Default shape is a 250 Hz
+    /// Low shelf and 1 kHz Mid with Q = 0.707; see set_damping_shape().
+    /// Zero is an exact bypass.
+    /// Amounts are smoothed over 20 ms; no allocation or tail reset occurs.
+    pub fn set_band_damping(&mut self, low_db: f32, mid_db: f32) -> Result<(), ConfigError> {
+        if [low_db, mid_db]
+            .iter()
+            .any(|x| !x.is_finite() || !(0.0..=24.0).contains(x))
+        {
+            return Err(ConfigError("band damping must be finite and in [0, 24] dB"));
+        }
+        self.target_damping_amounts = [low_db, mid_db].map(|db| 1.0 - 10.0_f32.powf(-db / 20.0));
+        Ok(())
+    }
+
+    /// Tune Low (20..2000 Hz), Mid (100..12000 Hz), and Mid Q (0.2..8).
+    /// Frequencies are limited to 0.45 * sample rate internally. Filter
+    /// coefficients move toward stable targets with a 20 ms time constant.
+    /// State is retained; only reset() clears the tail.
+    pub fn set_damping_shape(
+        &mut self,
+        low_hz: f32,
+        mid_hz: f32,
+        mid_q: f32,
+    ) -> Result<(), ConfigError> {
+        if !low_hz.is_finite()
+            || !(20.0..=2000.0).contains(&low_hz)
+            || !mid_hz.is_finite()
+            || !(100.0..=12000.0).contains(&mid_hz)
+            || !mid_q.is_finite()
+            || !(0.2..=8.0).contains(&mid_q)
+        {
+            return Err(ConfigError(
+                "damping shape: Low 20..2000 Hz, Mid 100..12000 Hz, Q 0.2..8",
+            ));
+        }
+        let max_hz = self.sample_rate as f32 * 0.45;
+        for delay in &mut self.delays {
+            delay
+                .low_damping
+                .target(DampingBranch::low_at(self.sample_rate, low_hz.min(max_hz)));
+            delay.mid_damping.target(DampingBranch::mid_at(
+                self.sample_rate,
+                mid_hz.min(max_hz),
+                mid_q,
+            ));
+        }
+        Ok(())
+    }
+
     /// Update targets without allocation or resetting the tail. Coefficients
     /// approach their targets with a 20 ms time constant. Call at control rate,
     /// not every sample: this computes exponentials and powers.
@@ -400,6 +541,13 @@ impl Reverb {
         let mut output = [0.0; 2];
         self.damping_coefficient +=
             self.smoothing * (self.target_damping_coefficient - self.damping_coefficient);
+        for (amount, target) in self
+            .damping_amounts
+            .iter_mut()
+            .zip(self.target_damping_amounts)
+        {
+            *amount += self.smoothing * (target - *amount);
+        }
         for (weight, target) in self
             .matrix_weights
             .iter_mut()
@@ -479,6 +627,12 @@ impl Reverb {
                 delay.lowpass = 0.0;
             }
             feedback[i] = delay.lowpass * delay.gain;
+            feedback[i] = delay
+                .low_damping
+                .process(feedback[i], self.damping_amounts[0]);
+            feedback[i] = delay
+                .mid_damping
+                .process(feedback[i], self.damping_amounts[1]);
             // Keep filter history warm even at zero; bypass without arithmetic
             // on the original signal so the default response stays unchanged.
             let diffused = self.loop_diffusers[i].process(feedback[i]);
@@ -521,6 +675,8 @@ impl Reverb {
             delay.buffer.fill(0.0);
             delay.position = 0;
             delay.lowpass = 0.0;
+            delay.low_damping.reset();
+            delay.mid_damping.reset();
             delay.random = delay.seed;
             delay.random_target = 0.0;
             delay.random_countdown = 0;
@@ -912,6 +1068,167 @@ mod tests {
                 }
                 let frame = reverb.process_sample(if i == 0 { 1.0 } else { 0.0 });
                 assert!(frame.iter().all(|x| x.is_finite() && x.abs() < 4.0));
+            }
+        }
+    }
+
+    fn branch_response(mut branch: DampingBranch, rate: u32, frequency: f32, db: f32) -> f64 {
+        let amount = 1.0 - 10.0_f32.powf(-db / 20.0);
+        let mut input_energy = 0.0_f64;
+        let mut output_energy = 0.0_f64;
+        for i in 0..rate {
+            let input = (std::f32::consts::TAU * frequency * i as f32 / rate as f32).sin();
+            let output = branch.process(input, amount);
+            if i >= rate / 2 {
+                input_energy += f64::from(input).powi(2);
+                output_energy += f64::from(output).powi(2);
+            }
+        }
+        (output_energy / input_energy).sqrt()
+    }
+
+    #[test]
+    fn damping_branches_are_passive_and_frequency_selective() {
+        for rate in [8000, 48000, 96000, 384000] {
+            let low = |hz| branch_response(DampingBranch::low(rate), rate, hz, 12.0);
+            let mid = |hz| branch_response(DampingBranch::mid(rate), rate, hz, 12.0);
+            assert!(low(50.0) < 0.35);
+            assert!(low(3000.0) > 0.95);
+            assert!((mid(1000.0) - 10.0_f64.powf(-12.0 / 20.0)).abs() < 0.002);
+            assert!(mid(50.0) > 0.98);
+            for db in [0.0, 6.0, 24.0] {
+                for hz in [20.0, 100.0, 250.0, 500.0, 1000.0, 2000.0, 3500.0] {
+                    for branch in [DampingBranch::low(rate), DampingBranch::mid(rate)] {
+                        assert!(branch_response(branch, rate, hz, db) <= 1.0001);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn band_damping_validates_atomically_and_zero_is_exact_bypass() {
+        let mut reverb = Reverb::new(Config::default()).unwrap();
+        reverb.set_band_damping(6.0, 12.0).unwrap();
+        let targets = reverb.target_damping_amounts;
+        for (low, mid) in [
+            (f32::NAN, 0.0),
+            (0.0, f32::INFINITY),
+            (-1.0, 0.0),
+            (0.0, 25.0),
+        ] {
+            assert!(reverb.set_band_damping(low, mid).is_err());
+            assert_eq!(reverb.target_damping_amounts, targets);
+        }
+        for mut branch in [DampingBranch::low(48000), DampingBranch::mid(48000)] {
+            for input in [1.0, -0.5, 0.0, 0.25, -0.0] {
+                assert_eq!(branch.process(input, 0.0).to_bits(), input.to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn damping_shape_validates_atomically_and_mid_q_controls_width() {
+        let mut reverb = Reverb::new(Config::default()).unwrap();
+        reverb.set_damping_shape(500.0, 2000.0, 4.0).unwrap();
+        let before = reverb.delays[0].mid_damping.target_a;
+        for shape in [
+            (f32::NAN, 1000.0, 1.0),
+            (250.0, f32::INFINITY, 1.0),
+            (250.0, 1000.0, f32::NAN),
+            (19.0, 1000.0, 1.0),
+            (250.0, 12001.0, 1.0),
+            (250.0, 1000.0, 8.1),
+        ] {
+            assert!(reverb.set_damping_shape(shape.0, shape.1, shape.2).is_err());
+            assert_eq!(reverb.delays[0].mid_damping.target_a, before);
+        }
+        for rate in [8000, 48000, 384000] {
+            for q in [0.2, 0.707, 8.0] {
+                let gain =
+                    branch_response(DampingBranch::mid_at(rate, 2000.0, q), rate, 2000.0, 12.0);
+                assert!((gain - 10.0_f64.powf(-12.0 / 20.0)).abs() < 0.003);
+            }
+            let broad =
+                branch_response(DampingBranch::mid_at(rate, 2000.0, 0.2), rate, 1000.0, 12.0);
+            let narrow =
+                branch_response(DampingBranch::mid_at(rate, 2000.0, 8.0), rate, 1000.0, 12.0);
+            assert!(narrow > broad + 0.2);
+            let shifted = branch_response(DampingBranch::low_at(rate, 1000.0), rate, 250.0, 12.0);
+            let original = branch_response(DampingBranch::low(rate), rate, 250.0, 12.0);
+            assert!(shifted < original);
+        }
+    }
+
+    #[test]
+    fn damping_shape_sweeps_stay_bounded_and_reset_restores_targets() {
+        for rate in [8000, 48000, 384000] {
+            let mut reverb = Reverb::new(Config {
+                sample_rate: rate,
+                t60_seconds: 20.0,
+                damping_hz: rate as f32 * 0.45,
+                ..Config::default()
+            })
+            .unwrap();
+            reverb.set_band_damping(12.0, 24.0).unwrap();
+            for i in 0..rate * 2 {
+                if i % 128 == 0 {
+                    let high = (i / 128) % 2 == 0;
+                    reverb
+                        .set_damping_shape(
+                            if high { 2000.0 } else { 20.0 },
+                            if high { 12000.0 } else { 100.0 },
+                            if high { 8.0 } else { 0.2 },
+                        )
+                        .unwrap();
+                }
+                let frame = reverb.process_sample(if i % 4096 == 0 { 0.2 } else { 0.0 });
+                assert!(frame.iter().all(|x| x.is_finite() && x.abs() < 4.0));
+            }
+            reverb.reset();
+            for delay in &reverb.delays {
+                assert_eq!(delay.mid_damping.a, delay.mid_damping.target_a);
+                assert_eq!(delay.mid_damping.state, [0.0; 2]);
+            }
+        }
+    }
+
+    #[test]
+    fn band_damping_shortens_tail_and_reset_clears_history() {
+        for matrix in MATRICES {
+            let config = Config {
+                matrix,
+                t60_seconds: 1.0,
+                ..Config::default()
+            };
+            let mut reference = Reverb::new(config).unwrap();
+            let mut damped = Reverb::new(config).unwrap();
+            damped.set_band_damping(12.0, 12.0).unwrap();
+            damped.damping_amounts = damped.target_damping_amounts;
+            let mut energy = [0.0_f64; 2];
+            for i in 0..96000 {
+                let input = if i == 0 { 1.0 } else { 0.0 };
+                for (index, frame) in [
+                    reference.process_sample(input),
+                    damped.process_sample(input),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    assert!(frame.iter().all(|x| x.is_finite()));
+                    if i > 24000 {
+                        energy[index] += frame.iter().map(|&x| f64::from(x).powi(2)).sum::<f64>();
+                    }
+                }
+            }
+            assert!(energy[1] < energy[0] * 0.5);
+            damped.reset();
+            for delay in &damped.delays {
+                assert_eq!(delay.low_damping.state, [0.0; 2]);
+                assert_eq!(delay.mid_damping.state, [0.0; 2]);
+            }
+            for _ in 0..4000 {
+                assert_eq!(damped.process_sample(0.0), [0.0; 2]);
             }
         }
     }

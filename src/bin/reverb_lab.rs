@@ -169,7 +169,14 @@ impl eframe::App for Lab {
             });
             ui.add(egui::Slider::new(&mut self.settings.diffusion, 0.0..=1.0).text("Input diffusion"));
             ui.add(egui::Slider::new(&mut self.settings.t60, 0.1..=20.0).logarithmic(true).text("T60 / s"));
-            ui.add(egui::Slider::new(&mut self.settings.damping, 100.0..=20_000.0).logarithmic(true).text("Damping / Hz"));
+            ui.add(egui::Slider::new(&mut self.settings.damping, 100.0..=20_000.0).logarithmic(true).text("High damping / Hz"));
+            ui.add(egui::Slider::new(&mut self.settings.damping_low, 0.0..=24.0).text("Low damping / dB"));
+            ui.add(egui::Slider::new(&mut self.settings.damping_mid, 0.0..=24.0).text("Mid damping / dB"));
+            egui::CollapsingHeader::new("Damping bands").show(ui, |ui| {
+                ui.add(egui::Slider::new(&mut self.settings.damping_low_hz, 20.0..=2000.0).logarithmic(true).text("Low / Hz"));
+                ui.add(egui::Slider::new(&mut self.settings.damping_mid_hz, 100.0..=12000.0).logarithmic(true).text("Mid / Hz"));
+                ui.add(egui::Slider::new(&mut self.settings.damping_mid_q, 0.2..=8.0).logarithmic(true).text("Mid Q"));
+            });
             ui.add(egui::Slider::new(&mut self.settings.wet, 0.0..=1.0).text("Dry / Wet"));
             ui.add(egui::Slider::new(&mut self.settings.gain_db, -60.0..=0.0).text("Output / dB"));
             ui.checkbox(&mut self.settings.bypass, "Bypass reverb (dry comparison, output gain retained)");
