@@ -2,8 +2,17 @@
 
 use std::fmt;
 
+pub mod colorless;
+pub mod difffdn;
+
 mod reverb;
 pub use reverb::Reverb;
+
+#[cfg(feature = "ir-analysis")]
+pub mod ir_analysis;
+
+#[cfg(feature = "ir-analysis")]
+pub mod ir_synthesis;
 
 #[cfg(feature = "gui")]
 pub mod preview;

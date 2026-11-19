@@ -30,6 +30,33 @@ unsafe impl GlobalAlloc for CountingAllocator {
 #[global_allocator]
 static ALLOCATOR: CountingAllocator = CountingAllocator;
 
+#[cfg(feature = "ir-analysis")]
+#[test]
+fn custom_stereo_seed_processing_and_reset_do_not_allocate_or_free() {
+    let mut text = String::from("rust-stereo-seed-v1");
+    for x in [1.0; 7]
+        .into_iter()
+        .chain([0.0; 7])
+        .chain([0.35; 8])
+        .chain([0.35, -0.35, 0.35, -0.35, 0.35, -0.35, 0.35, -0.35])
+    {
+        text.push_str(&format!(" {x}"));
+    }
+    let v2 = text.replacen("rust-stereo-seed-v1", "rust-stereo-seed-v2", 1)
+        + " .017 .021 .025 .029 .033 .037 .041 .047 .002 .65";
+    for state in [&text, &v2] {
+        let seed = algo_reverb::difffdn::seed::Seed::decode(state).unwrap();
+        let mut f = seed.build(48000).unwrap();
+        COUNT.with(|count| count.set(Some(0)));
+        for i in 0..48000 {
+            std::hint::black_box(f.process_stereo(if i == 0 { 1.0 } else { 0.0 }));
+        }
+        f.reset();
+        let allocations = COUNT.with(|count| count.replace(None).unwrap());
+        assert_eq!(allocations, 0);
+    }
+}
+
 #[test]
 fn processing_controls_and_reset_do_not_allocate_or_free() {
     let mut reverb = Reverb::new(Config::default()).unwrap();
@@ -48,6 +75,19 @@ fn processing_controls_and_reset_do_not_allocate_or_free() {
         }
         reverb.reset();
     }
+    let allocations = COUNT.with(|count| count.replace(None).unwrap());
+    assert_eq!(allocations, 0);
+}
+
+#[test]
+fn room_fdn_processing_and_reset_do_not_allocate_or_free() {
+    let text = "fdn-colorless-v1 48000 2 3 5 0 1 1 0 1 0 1 0 0 1\nroom-filters-v1\n1 .6 .1 -.1\n1 .5 -.1 .1\n1 1 .2 -.3\n1 1 -.1 .2\n";
+    let mut tank = algo_reverb::colorless::StaticFdn::from_room_profile(text).unwrap();
+    COUNT.with(|count| count.set(Some(0)));
+    for i in 0..4096 {
+        std::hint::black_box(tank.process_sample(if i == 0 { 1.0 } else { 0.0 }));
+    }
+    tank.reset();
     let allocations = COUNT.with(|count| count.replace(None).unwrap());
     assert_eq!(allocations, 0);
 }

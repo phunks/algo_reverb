@@ -1,0 +1,15 @@
+[package]
+name = "algo_vn"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+algo_reverb = { path = "..", features = ["ir-analysis"] }
+nice-plug = { version = "0.4.2", default-features = false, features = ["editor", "vst3"] }
+nice-plug-core = "0.4.2"
+nice-plug-egui = "0.6.0"
+egui-plugin = { package = "egui", version = "0.37.0", features = ["default_fonts"] }

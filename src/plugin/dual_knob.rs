@@ -3,6 +3,7 @@ use nice_plug::prelude::{FloatParam, Param, ParamSetter};
 
 /// Two independent host parameters in one control. Button ownership is locked
 /// until release, including when the pointer leaves the widget.
+#[allow(dead_code)] // Shared with Algo VN, which still uses dual-ring filters.
 pub(super) fn dual_knob(
     ui: &mut egui::Ui,
     amount: &FloatParam,
@@ -13,13 +14,22 @@ pub(super) fn dual_knob(
 }
 
 /// Single-parameter counterpart with the same ring rendering and gestures.
+pub(super) fn single_knob_without_value(
+    ui: &mut egui::Ui,
+    param: &FloatParam,
+    setter: &ParamSetter<'_>,
+) -> egui::Response {
+    knob(ui, &[param], setter).on_hover_text(param.name())
+}
+
+/// Single-parameter counterpart with its default value label.
 pub(super) fn single_knob(
     ui: &mut egui::Ui,
     param: &FloatParam,
     setter: &ParamSetter<'_>,
 ) -> egui::Response {
     ui.vertical_centered(|ui| {
-        let response = knob(ui, &[param], setter);
+        let response = single_knob_without_value(ui, param, setter);
         ui.label(param.to_string());
         response.on_hover_text(param.name())
     })
@@ -130,6 +140,7 @@ fn knob(ui: &mut egui::Ui, params: &[&FloatParam], setter: &ParamSetter<'_>) -> 
     })
 }
 
+#[allow(dead_code)] // Shared with Algo VN; DiffFDN has no Q control.
 pub(super) fn q_value(ui: &mut egui::Ui, param: &FloatParam, setter: &ParamSetter<'_>) {
     let mut value = param.modulated_plain_value();
     let response = ui.add(

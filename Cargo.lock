@@ -57,7 +57,7 @@ dependencies = [
 
 [[package]]
 name = "algo_reverb"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "eframe",
  "egui 0.37.0",
@@ -67,6 +67,17 @@ dependencies = [
  "nice-plug-egui",
  "rfd",
  "rodio",
+]
+
+[[package]]
+name = "algo_vn"
+version = "0.1.0"
+dependencies = [
+ "algo_reverb",
+ "egui 0.37.0",
+ "nice-plug",
+ "nice-plug-core",
+ "nice-plug-egui",
 ]
 
 [[package]]

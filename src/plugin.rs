@@ -1,7 +1,7 @@
-//! Host adapter. Device handling and WAV loading remain in the audition app.
+//! Live DiffFDN host adapter. Networks are prepared off the audio thread.
 
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU32, Ordering},
 };
 
@@ -14,9 +14,118 @@ use nice_plug_egui::{
     widgets::{ParamButton, ParamComboBox, ParamEnumButton},
 };
 
-use crate::{Config, DelayMode, Matrix, Reverb};
+use crate::{DelayMode, Matrix, difffdn::DiffFdn};
 
 mod dual_knob;
+#[path = "../vn_plugin/src/file_browser.rs"]
+mod file_browser;
+#[path = "../vn_plugin/src/limiter.rs"]
+#[allow(dead_code)] // Shared limiter also exposes a gain meter for Algo VN.
+mod live_limiter;
+mod peak_space;
+mod seed_import;
+mod slice_repeat;
+
+#[derive(Enum, Clone, Copy, PartialEq, Eq, Debug)]
+enum RoomPreset {
+    #[id = "salon"]
+    #[name = "French Salon"]
+    Salon,
+    #[id = "damped"]
+    #[name = "Damped Large Room"]
+    Damped,
+}
+
+fn room_text(room: RoomPreset) -> &'static str {
+    match room {
+        RoomPreset::Salon => include_str!("../resources/difffdn/salon.fdn"),
+        RoomPreset::Damped => include_str!("../resources/difffdn/damped.fdn"),
+    }
+}
+
+struct LiveDiffFdn {
+    rooms: [peak_space::Space; 2],
+    transition_samples: u32,
+    position: u32,
+}
+
+// Fixed, wet-only reference trims: approximately unity RMS at 48 kHz with
+// default controls and the log-spaced multitone regression below. Not AGC or
+// a perceptual loudness guarantee; feedback edits and sample rate affect gain.
+const DIFFFDN_WET_GAINS: [f64; 2] = [0.053_703_179_637_025_27, 0.084_139_514_164_519_51]; // -25.4 / -21.5 dB
+
+fn difffdn_mix_gains(wet: f32) -> (f32, f32) {
+    if wet <= 0.0 {
+        return (1.0, 0.0);
+    }
+    if wet >= 1.0 {
+        return (0.0, 1.0);
+    }
+    let (wet, dry) = (wet * std::f32::consts::FRAC_PI_2).sin_cos();
+    (dry, wet)
+}
+
+impl LiveDiffFdn {
+    fn new(rate: u32, room: RoomPreset) -> Option<Self> {
+        let load = |r| {
+            let load = || {
+                DiffFdn::parse(room_text(r))
+                    .and_then(|f| f.at_sample_rate(rate))
+                    .ok()
+            };
+            Some(peak_space::Space::new([load()?, load()?]))
+        };
+        let transition_samples = (0.15 * rate as f64).round() as u32;
+        Some(Self {
+            rooms: [load(RoomPreset::Salon)?, load(RoomPreset::Damped)?],
+            transition_samples,
+            position: if room == RoomPreset::Salon {
+                0
+            } else {
+                transition_samples
+            },
+        })
+    }
+    fn reset(&mut self, room: RoomPreset) {
+        for f in &mut self.rooms {
+            f.reset();
+        }
+        self.position = if room == RoomPreset::Salon {
+            0
+        } else {
+            self.transition_samples
+        };
+    }
+    fn process(&mut self, input: f32, room: RoomPreset) -> [f32; 2] {
+        // Inactive networks are cleared at fade completion, so restarting them
+        // never replays a frozen tail. Reversal preserves both running states.
+        let target = if room == RoomPreset::Salon {
+            0
+        } else {
+            self.transition_samples
+        };
+        if self.position == target {
+            let index = usize::from(room == RoomPreset::Damped);
+            let wet =
+                (DIFFFDN_WET_GAINS[index] * self.rooms[index].process_sample(input as f64)) as f32;
+            return [wet; 2];
+        }
+        if self.position < target {
+            self.position += 1;
+        } else {
+            self.position -= 1;
+        }
+        let blend = self.position as f64 / self.transition_samples as f64;
+        let a = self.rooms[0].process_sample(input as f64);
+        let b = self.rooms[1].process_sample(input as f64);
+        let wet =
+            ((1.0 - blend) * DIFFFDN_WET_GAINS[0] * a + blend * DIFFFDN_WET_GAINS[1] * b) as f32;
+        if self.position == target {
+            self.rooms[usize::from(room == RoomPreset::Salon)].reset();
+        }
+        [wet; 2]
+    }
+}
 
 fn damping_frequency(name: &str, default: f32, min: f32, max: f32) -> FloatParam {
     FloatParam::new(
@@ -144,6 +253,10 @@ struct DuckTiming {
 
 #[derive(Params)]
 struct ReverbParams {
+    #[persist = "seed_wav_location_v1"]
+    seed_wav_location: Mutex<(std::path::PathBuf, std::path::PathBuf)>,
+    #[persist = "rust_stereo_seed_v1"]
+    seed_state: Mutex<(String, String)>,
     #[id = "matrix"]
     matrix: EnumParam<MatrixMode>,
     #[id = "diffusion"]
@@ -190,11 +303,133 @@ struct ReverbParams {
     damping_mid_q: FloatParam,
     #[id = "duck_detection"]
     duck_detection: EnumParam<DuckDetection>,
+    #[id = "difffdn_room"]
+    room: EnumParam<RoomPreset>,
+    #[id = "difffdn_damping"]
+    extra_damping: FloatParam,
+    #[id = "seed_enabled"]
+    seed_enabled: BoolParam,
+    #[id = "space_enabled"]
+    space_enabled: BoolParam,
+    #[id = "space_threshold"]
+    space_threshold: FloatParam,
+    #[id = "space_decay"]
+    space_decay: FloatParam,
+    #[id = "space_swell"]
+    space_swell: FloatParam,
+    #[id = "space_release"]
+    space_release: FloatParam,
+    #[id = "space_steps"]
+    space_steps: FloatParam,
+    #[id = "repeat_enabled"]
+    repeat_enabled: BoolParam,
+    #[id = "repeat_mode"]
+    repeat_mode: EnumParam<slice_repeat::Mode>,
+    #[id = "repeat_division"]
+    repeat_division: EnumParam<slice_repeat::Division>,
+    #[id = "repeat_nudge"]
+    repeat_nudge: FloatParam,
+    #[id = "repeat_feedback"]
+    repeat_feedback: FloatParam,
+    #[id = "repeat_mix"]
+    repeat_mix: FloatParam,
+    #[id = "repeat_high_cut"]
+    repeat_high_cut: FloatParam,
+    #[id = "repeat_high_pass"]
+    repeat_high_pass: FloatParam,
+}
+
+fn repeat_frequency(name: &'static str, default: f32, min: f32, max: f32) -> FloatParam {
+    FloatParam::new(
+        name,
+        default,
+        FloatRange::Skewed {
+            min,
+            max,
+            factor: FloatRange::skew_factor(-2.),
+        },
+    )
+    .with_unit(" Hz")
+    .with_value_to_string(Arc::new(|v| format!("{v:.0}")))
+}
+
+fn space_time(name: &'static str, default: f32) -> FloatParam {
+    FloatParam::new(
+        name,
+        default,
+        FloatRange::Skewed {
+            min: 10.,
+            max: 3000.,
+            factor: FloatRange::skew_factor(-2.),
+        },
+    )
+    .with_unit(" ms")
+    .with_value_to_string(Arc::new(|v| format!("{v:.0}")))
 }
 
 impl Default for ReverbParams {
     fn default() -> Self {
         Self {
+            repeat_enabled: BoolParam::new("Slice Repeat", false),
+            repeat_mode: EnumParam::new("Repeat Mode", slice_repeat::Mode::Space),
+            repeat_division: EnumParam::new("Division", slice_repeat::Division::Eighth),
+            repeat_nudge: FloatParam::new(
+                "Groove Offset",
+                0.,
+                FloatRange::Linear {
+                    min: -50.,
+                    max: 50.,
+                },
+            )
+            .with_unit(" ms")
+            .with_value_to_string(Arc::new(|v| format!("{v:+.2}"))),
+            repeat_feedback: FloatParam::new(
+                "Feedback",
+                0.6,
+                FloatRange::Linear { min: 0., max: 0.95 },
+            )
+            .with_value_to_string(Arc::new(|v| format!("{:.0}%", v * 100.))),
+            repeat_mix: FloatParam::new(
+                "Repeat Mix",
+                0.65,
+                FloatRange::Linear { min: 0., max: 1. },
+            )
+            .with_value_to_string(Arc::new(|v| format!("{:.0}%", v * 100.))),
+            repeat_high_cut: repeat_frequency("High Cut", 6000., 500., 20000.),
+            repeat_high_pass: repeat_frequency("High Pass", 120., 20., 4000.),
+            seed_state: Mutex::default(),
+            seed_wav_location: Mutex::default(),
+            seed_enabled: BoolParam::new("Use IR seed", false),
+            space_enabled: BoolParam::new("Peak Space", false),
+            space_threshold: FloatParam::new(
+                "Sensitivity",
+                -24.,
+                FloatRange::Linear { min: -60., max: 0. },
+            )
+            .with_unit(" dBFS"),
+            space_decay: space_time("Space Decay", 150.),
+            space_swell: space_time("Swell", 500.),
+            space_release: space_time("Space Release", 300.),
+            space_steps: FloatParam::new(
+                "Swell Steps",
+                0.,
+                FloatRange::Linear { min: 0., max: 8. },
+            )
+            .with_step_size(1.)
+            .with_value_to_string(Arc::new(|v| {
+                if v < 0.5 {
+                    "Smooth".into()
+                } else {
+                    format!("{v:.0}")
+                }
+            })),
+            room: EnumParam::new("Room", RoomPreset::Salon),
+            extra_damping: FloatParam::new(
+                "Damping",
+                0.0,
+                FloatRange::Linear { min: 0.0, max: 1.0 },
+            )
+            .with_value_to_string(Arc::new(|value| format!("{:.0}%", value * 100.0))),
             matrix: EnumParam::new("Matrix", MatrixMode::Hybrid),
             damping_low_hz: damping_frequency("Low Frequency", 250.0, 20.0, 2000.0),
             damping_mid_hz: damping_frequency("Mid Frequency", 1000.0, 100.0, 12000.0),
@@ -334,52 +569,36 @@ impl Default for ReverbParams {
     }
 }
 
-#[derive(Clone, Copy, PartialEq)]
-struct Targets {
-    t60: f32,
-    damping: f32,
-    damping_low: f32,
-    damping_mid: f32,
-    damping_low_hz: f32,
-    damping_mid_hz: f32,
-    damping_mid_q: f32,
-    matrix: Matrix,
-    diffusion: f32,
-    loop_diffusion: f32,
-    delay_mode: DelayMode,
-    mod_depth: f32,
-    mod_rate: f32,
-}
-
-impl ReverbParams {
-    fn targets(&self, sample_rate: u32) -> Targets {
-        Targets {
-            t60: self.t60.value(),
-            damping: self.damping.value().min(sample_rate as f32 * 0.5),
-            damping_low: self.damping_low.value(),
-            damping_mid: self.damping_mid.value(),
-            damping_low_hz: self.damping_low_hz.value(),
-            damping_mid_hz: self.damping_mid_hz.value(),
-            damping_mid_q: self.damping_mid_q.value(),
-            matrix: self.matrix.value().into(),
-            diffusion: self.diffusion.value(),
-            loop_diffusion: self.loop_diffusion.value(),
-            delay_mode: self.delay_mode.value().into(),
-            mod_depth: self.mod_depth.value(),
-            mod_rate: self.mod_rate.value(),
-        }
-    }
+fn apply_live_controls(f: &mut DiffFdn, p: &ReverbParams) {
+    f.set_live_controls(
+        p.t60.value(),
+        p.damping.value(),
+        p.matrix.value().into(),
+        p.diffusion.value(),
+        p.loop_diffusion.value(),
+        p.damping_low.value(),
+        p.damping_mid.value(),
+        p.damping_low_hz.value(),
+        p.damping_mid_hz.value(),
+        p.damping_mid_q.value(),
+        p.delay_mode.value().into(),
+        p.mod_depth.value(),
+        p.mod_rate.value(),
+    );
 }
 
 struct PluginEngine {
-    reverb: Reverb,
+    repeat: slice_repeat::Repeat,
+    seed: seed_import::Playback,
+    reverb: LiveDiffFdn,
     sample_rate: u32,
-    targets: Targets,
     wet: f32,
     gain: f32,
     bypass: f32,
     smoothing: f32,
     duck_reduction: f32,
+    limiter: live_limiter::Limiter,
+    wet_limiter: live_limiter::Limiter,
     duck_transient: DuckTransient,
     duck_detection: DuckDetection,
     duck_source: DuckSource,
@@ -392,39 +611,30 @@ impl PluginEngine {
             return None;
         }
         let sample_rate = sample_rate as u32;
-        let targets = params.targets(sample_rate);
-        let mut reverb = Reverb::new(Config {
-            sample_rate,
-            t60_seconds: targets.t60,
-            damping_hz: targets.damping,
-            matrix: targets.matrix,
-        })
-        .ok()?;
-        reverb
-            .set_band_damping(targets.damping_low, targets.damping_mid)
-            .ok()?;
-        reverb
-            .set_damping_shape(
-                targets.damping_low_hz,
-                targets.damping_mid_hz,
-                targets.damping_mid_q,
-            )
-            .ok()?;
-        reverb.set_diffusion(targets.diffusion).ok()?;
-        reverb.set_loop_diffusion(targets.loop_diffusion).ok()?;
-        reverb
-            .set_delay_modulation(targets.delay_mode, targets.mod_depth, targets.mod_rate)
-            .ok()?;
-        reverb.reset();
+        let mut reverb = LiveDiffFdn::new(sample_rate, params.room.value())?;
+        for f in &mut reverb.rooms {
+            f.set_damping(params.extra_damping.value() as f64);
+        }
+        for f in &mut reverb.rooms {
+            f.update(params);
+        }
+        reverb.reset(params.room.value());
+        let mut limiter = live_limiter::Limiter::default();
+        limiter.configure(sample_rate);
+        let mut wet_limiter = live_limiter::Limiter::default();
+        wet_limiter.configure(sample_rate);
         Some(Self {
+            repeat: slice_repeat::Repeat::new(sample_rate),
+            seed: seed_import::Playback::restore(sample_rate, params),
             reverb,
             sample_rate,
-            targets,
             wet: params.wet.value(),
             gain: util::db_to_gain(params.output_db.value()),
             bypass: if params.bypass.value() { 1.0 } else { 0.0 },
             smoothing: 1.0 - (-1.0 / (0.01 * sample_rate as f32)).exp(),
             duck_reduction: 0.0,
+            limiter,
+            wet_limiter,
             duck_transient: DuckTransient {
                 armed: true,
                 ..Default::default()
@@ -435,32 +645,21 @@ impl PluginEngine {
     }
 
     fn update(&mut self, params: &ReverbParams) {
-        let next = params.targets(self.sample_rate);
-        if next != self.targets {
-            // Host parameters are range checked, damping is clamped to Nyquist.
-            let _ = self
-                .reverb
-                .set_parameters(next.t60, next.damping, next.matrix);
-            let _ = self.reverb.set_diffusion(next.diffusion);
-            let _ = self
-                .reverb
-                .set_band_damping(next.damping_low, next.damping_mid);
-            let _ = self.reverb.set_loop_diffusion(next.loop_diffusion);
-            let _ = self.reverb.set_damping_shape(
-                next.damping_low_hz,
-                next.damping_mid_hz,
-                next.damping_mid_q,
-            );
-            let _ =
-                self.reverb
-                    .set_delay_modulation(next.delay_mode, next.mod_depth, next.mod_rate);
-            self.targets = next;
+        self.repeat.update(params);
+        self.seed.update(params);
+        for f in &mut self.reverb.rooms {
+            f.update(params);
+            f.set_damping(params.extra_damping.value() as f64);
         }
     }
 
     fn reset(&mut self, params: &ReverbParams) {
+        self.repeat.reset();
         self.update(params);
-        self.reverb.reset();
+        self.reverb.reset(params.room.value());
+        self.seed.reset();
+        self.limiter.reset();
+        self.wet_limiter.reset();
         // Host reset restores the current parameter state without allocating or
         // carrying coefficient ramps over from the previous transport position.
         self.wet = params.wet.value();
@@ -473,12 +672,28 @@ impl PluginEngine {
         };
     }
 
+    #[cfg(test)]
     fn process(
         &mut self,
         buffer: &mut Buffer,
         params: &ReverbParams,
         sidechain: Option<&Buffer>,
     ) -> f32 {
+        self.process_with_wet_output(buffer, params, sidechain, None)
+    }
+
+    fn process_with_wet_output(
+        &mut self,
+        buffer: &mut Buffer,
+        params: &ReverbParams,
+        sidechain: Option<&Buffer>,
+        mut wet_output: Option<&mut Buffer>,
+    ) -> f32 {
+        if let Some(output) = wet_output.as_mut() {
+            for channel in output.as_slice() {
+                channel.fill(0.);
+            }
+        }
         self.update(params);
         let target_wet = params.wet.value();
         let target_gain = util::db_to_gain(params.output_db.value());
@@ -515,11 +730,31 @@ impl PluginEngine {
                 finite(*frame.get_mut(0).unwrap()),
                 finite(*frame.get_mut(1).unwrap()),
             ];
-            let wet = self.reverb.process_sample(dry[0] * 0.5 + dry[1] * 0.5);
-            // Stereo peak linking avoids cancellation of anti-phase trigger signals.
-            // Missing/disconnected external input means silence, never internal fallback.
+            let detector_input = dry;
+            let input = dry[0] * 0.5 + dry[1] * 0.5;
+            let input = if self.repeat.mode() == slice_repeat::Mode::Input {
+                self.repeat.process([input; 2])[0]
+            } else {
+                input
+            };
+            let blend = self.seed.advance(params.seed_enabled.value());
+            let mut wet = if blend < 1.0 {
+                self.reverb.process(input, params.room.value())
+            } else {
+                [0.0; 2]
+            };
+            let custom = self.seed.process(input);
+            for c in 0..2 {
+                wet[c] = wet[c] * (1.0 - blend) + custom[c] * blend;
+            }
+            if self.seed.just_selected() {
+                self.reverb.reset(params.room.value());
+            }
+            if self.repeat.mode() == slice_repeat::Mode::Space {
+                wet = self.repeat.process(wet);
+            }
             let detector = match params.duck_source.value() {
-                DuckSource::Internal => dry[0].abs().max(dry[1].abs()),
+                DuckSource::Internal => detector_input[0].abs().max(detector_input[1].abs()),
                 DuckSource::External => sidechain.map_or(0.0, |channels| {
                     channels
                         .iter()
@@ -553,11 +788,24 @@ impl PluginEngine {
             self.wet += self.smoothing * (target_wet - self.wet);
             self.gain += self.smoothing * (target_gain - self.gain);
             self.bypass += self.smoothing * (target_bypass - self.bypass);
+            let (dry_gain, wet_gain) = difffdn_mix_gains(self.wet);
+            let wet_only = self
+                .wet_limiter
+                .process(wet.map(|x| self.gain * duck_gain * x), true);
+            if let Some(output) = wet_output.as_mut() {
+                for (c, channel) in output.as_slice().iter_mut().take(2).enumerate() {
+                    if let Some(sample) = channel.get_mut(index) {
+                        *sample = wet_only[c] * (1. - self.bypass);
+                    }
+                }
+            }
+            let effected = std::array::from_fn(|channel| {
+                self.gain * (dry_gain * dry[channel] + wet_gain * duck_gain * wet[channel])
+            });
+            let effected = self.limiter.process(effected, true);
             for channel in 0..2 {
-                let effected = self.gain
-                    * ((1.0 - self.wet) * dry[channel] + self.wet * duck_gain * wet[channel]);
                 // True bypass crossfade: unity dry, not the audition app's gain-retaining bypass.
-                let output = (1.0 - self.bypass) * effected + self.bypass * dry[channel];
+                let output = (1.0 - self.bypass) * effected[channel] + self.bypass * dry[channel];
                 *frame.get_mut(channel).unwrap() = output;
                 peak = peak.max(output.abs());
             }
@@ -568,6 +816,7 @@ impl PluginEngine {
 
 #[derive(Default)]
 struct AlgoReverb {
+    seed_import: Arc<seed_import::Shared>,
     params: Arc<ReverbParams>,
     engine: Option<PluginEngine>,
     peak: Arc<AtomicU32>,
@@ -584,8 +833,10 @@ impl Plugin for AlgoReverb {
         main_input_channels: NonZeroU32::new(2),
         main_output_channels: NonZeroU32::new(2),
         aux_input_ports: &[new_nonzero_u32(2)],
+        aux_output_ports: &[new_nonzero_u32(2)],
         names: PortNames {
             aux_inputs: &["Sidechain"],
+            aux_outputs: &["Wet Out"],
             ..PortNames::const_default()
         },
         ..AudioIOLayout::const_default()
@@ -613,6 +864,8 @@ impl Plugin for AlgoReverb {
                 reduction: self.reduction.clone(),
                 context: None,
                 held_peak: 0.0,
+                seed_import: self.seed_import.clone(),
+                seed_browser: seed_import::Browser::default(),
             },
         )
     }
@@ -621,7 +874,7 @@ impl Plugin for AlgoReverb {
         &mut self,
         layout: &AudioIOLayout,
         config: &BufferConfig,
-        _context: &mut impl ActivateContext<Self>,
+        context: &mut impl ActivateContext<Self>,
     ) -> bool {
         if layout.main_input_channels != NonZeroU32::new(2)
             || layout.main_output_channels != NonZeroU32::new(2)
@@ -629,6 +882,12 @@ impl Plugin for AlgoReverb {
             return false;
         }
         self.engine = PluginEngine::new(config.sample_rate, &self.params);
+        // Activation may restore a different session; discard obsolete handoffs here.
+        self.seed_import.clear_pending();
+        self.seed_import
+            .rate
+            .store(config.sample_rate as u32, Ordering::Release);
+        context.set_latency_samples(0);
         self.engine.is_some()
     }
 
@@ -640,11 +899,15 @@ impl Plugin for AlgoReverb {
         self.reduction.store(0, Ordering::Relaxed);
     }
 
+    fn deactivate(&mut self) {
+        self.seed_import.rate.store(0, Ordering::Release);
+    }
+
     fn process(
         &mut self,
         buffer: &mut Buffer,
         aux: &mut AuxiliaryBuffers,
-        _context: &mut impl ProcessContext<Self>,
+        context: &mut impl ProcessContext<Self>,
     ) -> ProcessStatus {
         let Some(engine) = &mut self.engine else {
             return ProcessStatus::Error("Plugin is not activated");
@@ -652,21 +915,43 @@ impl Plugin for AlgoReverb {
         if buffer.channels() != 2 {
             return ProcessStatus::Error("Stereo I/O required");
         }
-        let peak = engine.process(buffer, &self.params, aux.inputs.first());
+        engine.seed.receive(&self.seed_import, engine.sample_rate);
+        let transport = context.transport();
+        engine.repeat.transport(
+            transport.tempo,
+            transport.pos_beats(),
+            transport.playing,
+            buffer.samples(),
+        );
+        let peak = engine.process_with_wet_output(
+            buffer,
+            &self.params,
+            aux.inputs.first(),
+            aux.outputs.first_mut(),
+        );
         self.reduction
             .store(engine.duck_reduction.to_bits(), Ordering::Relaxed);
         // Nonnegative finite floats have the same ordering as their bit patterns.
         self.peak.fetch_max(peak.to_bits(), Ordering::Relaxed);
-        // Conservative fixed tail avoids cutting off a long tail when T60 is automated down.
+        // Conservative fixed tail accommodates the fitted rooms and live controls.
         // This is a host scheduling hint, not an assertion of exact silence at this time.
-        ProcessStatus::Tail(engine.sample_rate * 61)
+        // At 20 BPM / quarter notes / 95% feedback, -120 dB takes about 810 s,
+        // in addition to the original reverb tail. Leave conservative headroom.
+        ProcessStatus::Tail(
+            engine.sample_rate
+                * if self.params.repeat_enabled.value() && self.params.space_enabled.value() {
+                    960
+                } else {
+                    61
+                },
+        )
     }
 }
 
 impl ClapPlugin for AlgoReverb {
     const CLAP_ID: &'static str = "com.algo.algo-reverb";
     const CLAP_DESCRIPTION: Option<&'static str> =
-        Some("Eight-line FDN with hybrid mixing and input diffusion");
+        Some("IR-derived eight-line DiffFDN with passive damping");
     const CLAP_MANUAL_URL: Option<&'static str> = None;
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
     const CLAP_FEATURES: &'static [ClapFeature] = &[
@@ -734,6 +1019,8 @@ fn editor_fonts() -> egui::FontDefinitions {
 }
 
 struct ReverbEditor {
+    seed_browser: seed_import::Browser,
+    seed_import: Arc<seed_import::Shared>,
     params: Arc<ReverbParams>,
     peak: Arc<AtomicU32>,
     reduction: Arc<AtomicU32>,
@@ -772,9 +1059,36 @@ impl NiceEguiApp for ReverbEditor {
 
 impl ReverbEditor {
     fn draw(&mut self, ui: &mut egui::Ui) {
-        egui::Frame::new()
-            .inner_margin(16.0)
-            .show(ui, |ui| self.draw_contents(ui));
+        egui::Frame::new().inner_margin(16.0).show(ui, |ui| {
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .max_height((ui.available_height() - 88.0).max(100.0))
+                .show(ui, |ui| self.draw_contents(ui));
+            self.draw_footer(ui);
+        });
+    }
+
+    fn draw_footer(&mut self, ui: &mut egui::Ui) {
+        let peak = f32::from_bits(self.peak.swap(0, Ordering::Relaxed));
+        self.held_peak = self.held_peak.max(peak);
+        ui.horizontal(|ui| {
+            let peak_text = egui::RichText::new(format!(
+                "Peak since reset: {:.1} dBFS",
+                20.0 * self.held_peak.max(1e-6).log10()
+            ));
+            if self.held_peak > 1.0 {
+                ui.label(peak_text.color(egui::Color32::YELLOW))
+                    .on_hover_text("Above 0 dBFS — lower input/Output. Bypass is unprotected.");
+            } else {
+                ui.label(peak_text);
+            }
+            if ui.button("Reset peak").clicked() {
+                self.held_peak = 0.0;
+            }
+        });
+        ui.small("Stereo dry · mono-summed wet · use 100% wet on a send");
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(50));
     }
 
     fn draw_contents(&mut self, ui: &mut egui::Ui) {
@@ -793,95 +1107,159 @@ impl ReverbEditor {
         });
         ui.add_space(8.0);
         ui.separator();
-        ui.horizontal(|ui| {
-            ui.label("Matrix");
-            ui.add(ParamComboBox::for_param(&self.params.matrix, &setter).with_width(260.0));
-        });
-        // Reveal all controls immediately without asking the host to resize.
-        // Close this section to reach the bottom controls in the fixed window.
-        let modulation_id = ui.make_persistent_id("delay_modulation_open");
-        let mut expanded =
-            ui.data_mut(|data| data.get_temp::<bool>(modulation_id).unwrap_or(false));
-        let header = ui.horizontal(|ui| {
-            let arrow = ui.small_button(if expanded { "▾" } else { "▸" });
-            let label = ui.selectable_label(expanded, "Delay Modulation");
-            arrow.clicked() || label.clicked()
-        });
-        if header.inner {
-            expanded = !expanded;
-            ui.data_mut(|data| data.insert_temp(modulation_id, expanded));
-            ui.ctx().request_repaint();
-        }
-        if expanded {
-            ui.indent(modulation_id, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label("Delay");
-                    ui.add(
-                        ParamComboBox::for_param(&self.params.delay_mode, &setter)
-                            .with_width(260.0),
-                    );
-                });
-                knob_row(
-                    ui,
-                    &[&self.params.mod_depth, &self.params.mod_rate],
-                    &setter,
-                );
-            });
-        }
-        for row in [
-            &self.params.diffusion,
-            &self.params.t60,
-            &self.params.loop_diffusion,
-            &self.params.wet,
-            &self.params.output_db,
-        ]
-        .chunks(3)
+        self.seed_browser
+            .draw(ui, &self.params, &self.seed_import, &setter);
         {
-            knob_row(ui, row, &setter);
-        }
-        ui.label("Damping · feedback attenuation");
-        let spacing = ui.spacing().item_spacing.x;
-        let width = ((ui.available_width() - spacing * 3.0) / 4.0).min(116.0);
-        ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
-            for (amount, frequency) in [
-                (&self.params.damping_low, &self.params.damping_low_hz),
-                (&self.params.damping_mid, &self.params.damping_mid_hz),
-            ] {
+            let modulation_id = ui.make_persistent_id("delay_modulation_open");
+            let mut expanded =
+                ui.data_mut(|data| data.get_temp::<bool>(modulation_id).unwrap_or(false));
+            #[cfg(test)]
+            if ui.data_mut(|d| {
+                d.get_temp::<bool>(egui::Id::unique("test_modulation_open"))
+                    .unwrap_or(false)
+            }) {
+                expanded = true;
+            }
+            let header = ui.horizontal(|ui| {
+                let arrow = ui.small_button(if expanded { "▾" } else { "▸" });
+                let label = ui.selectable_label(expanded, "Delay Modulation");
+                arrow.clicked() || label.clicked()
+            });
+            if header.inner {
+                expanded = !expanded;
+                ui.data_mut(|data| data.insert_temp(modulation_id, expanded));
+                ui.ctx().request_repaint();
+            }
+            if expanded {
+                ui.indent(modulation_id, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Delay");
+                        ui.add(
+                            ParamComboBox::for_param(&self.params.delay_mode, &setter)
+                                .with_width(260.0),
+                        );
+                    });
+                    knob_row(
+                        ui,
+                        &[&self.params.mod_depth, &self.params.mod_rate],
+                        &setter,
+                    );
+                    if self.params.delay_mode.value() == DelayReadMode::Static {
+                        ui.small(
+                            "Static: modulation off. Select Random / Linear or Random / Allpass.",
+                        );
+                    }
+                });
+            }
+            for row in [
+                &self.params.diffusion,
+                &self.params.t60,
+                &self.params.loop_diffusion,
+                &self.params.wet,
+                &self.params.output_db,
+                &self.params.extra_damping,
+            ]
+            .chunks(3)
+            {
+                knob_row(ui, row, &setter);
+            }
+            ui.label("Damping · feedback attenuation");
+            let spacing = ui.spacing().item_spacing.x;
+            let width = ((ui.available_width() - spacing * 3.0) / 4.0).min(116.0);
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                for (amount, frequency) in [
+                    (&self.params.damping_low, &self.params.damping_low_hz),
+                    (&self.params.damping_mid, &self.params.damping_mid_hz),
+                ] {
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(width, 0.0),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            ui.label(knob_label(amount));
+                            ui.add_space(4.0);
+                            dual_knob::dual_knob(ui, amount, frequency, &setter);
+                            ui.small(format!(
+                                "{:.1} dB · {:.0} Hz",
+                                amount.value(),
+                                frequency.value()
+                            ));
+                        },
+                    );
+                }
                 ui.allocate_ui_with_layout(
                     egui::vec2(width, 0.0),
                     egui::Layout::top_down(egui::Align::Center),
                     |ui| {
-                        ui.label(knob_label(amount));
+                        ui.label("High Damp");
                         ui.add_space(4.0);
-                        dual_knob::dual_knob(ui, amount, frequency, &setter);
-                        ui.small(format!(
-                            "{:.1} dB · {:.0} Hz",
-                            amount.value(),
-                            frequency.value()
-                        ));
+                        dual_knob::single_knob(ui, &self.params.damping, &setter);
                     },
                 );
-            }
-            ui.allocate_ui_with_layout(
-                egui::vec2(width, 0.0),
-                egui::Layout::top_down(egui::Align::Center),
-                |ui| {
-                    ui.label("High Damp");
-                    ui.add_space(4.0);
-                    dual_knob::single_knob(ui, &self.params.damping, &setter);
-                },
+                ui.allocate_ui_with_layout(
+                    egui::vec2(width, 0.0),
+                    egui::Layout::top_down(egui::Align::Center),
+                    |ui| {
+                        ui.label("Mid Q");
+                        ui.add_space(20.0);
+                        dual_knob::q_value(ui, &self.params.damping_mid_q, &setter);
+                    },
+                );
+            });
+            ui.small("Low / Mid: left drag = dB · right drag = Hz · Shift = fine");
+            ui.small("DiffFDN · leveled Wet · safety -1 dBFS")
+                .on_hover_text(
+                    "T60 adds loop loss to the fitted absorption. Bypass is unprotected.",
+                );
+        }
+
+        ui.group(|ui| {
+            ui.heading("Peak Space");
+            ui.add(
+                ParamButton::for_param(&self.params.space_enabled, &setter)
+                    .with_label("Enable Peak Space"),
             );
-            ui.allocate_ui_with_layout(
-                egui::vec2(width, 0.0),
-                egui::Layout::top_down(egui::Align::Center),
-                |ui| {
-                    ui.label("Mid Q");
-                    ui.add_space(20.0);
-                    dual_knob::q_value(ui, &self.params.damping_mid_q, &setter);
-                },
+            ui.small("Onset reset → dip → swell · previous space releases. +5 ms wet predelay.");
+            knob_row(
+                ui,
+                &[
+                    &self.params.space_threshold,
+                    &self.params.space_decay,
+                    &self.params.space_swell,
+                    &self.params.space_release,
+                ],
+                &setter,
             );
+            knob_row(ui, &[&self.params.space_steps], &setter);
+            ui.small("Swell Steps: Smooth or 1–8 rises · softened edges, same total Swell time.");
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.add(
+                    ParamButton::for_param(&self.params.repeat_enabled, &setter)
+                        .with_label("Slice Repeat"),
+                );
+                ui.add(ParamEnumButton::cycling(&self.params.repeat_mode, &setter));
+                ui.add(ParamEnumButton::cycling(
+                    &self.params.repeat_division,
+                    &setter,
+                ));
+            });
+            knob_row(
+                ui,
+                &[
+                    &self.params.repeat_feedback,
+                    &self.params.repeat_mix,
+                    &self.params.repeat_high_cut,
+                    &self.params.repeat_high_pass,
+                ],
+                &setter,
+            );
+            ui.small("Requires Peak Space · tempo sync (20–400 BPM; fallback 120).");
+            knob_row(ui, &[&self.params.repeat_nudge], &setter);
+            ui.small("Groove: fixed ±ms shift · interval unchanged · negative = ahead, positive = behind.");
+            ui.small("Extra stereo Wet Out: after ducking/output, independent of Dry/Wet.");
+            ui.small("Space: repeat wet slices · Input: repeat slices into the space.");
+            ui.small("High Cut / High Pass filter every repeat · 2 ms softened slice edges.");
         });
-        ui.small("Low / Mid: left drag = dB · right drag = Hz · Shift = fine");
         ui.separator();
         ui.add_space(8.0);
         ui.horizontal(|ui| {
@@ -914,26 +1292,6 @@ impl ReverbEditor {
         ui.add_space(8.0);
         ui.separator();
         ui.add_space(8.0);
-        let peak = f32::from_bits(self.peak.swap(0, Ordering::Relaxed));
-        self.held_peak = self.held_peak.max(peak);
-        ui.horizontal(|ui| {
-            let peak_text = egui::RichText::new(format!(
-                "Peak since reset: {:.1} dBFS",
-                20.0 * self.held_peak.max(1e-6).log10()
-            ));
-            if self.held_peak > 1.0 {
-                ui.label(peak_text.color(egui::Color32::YELLOW))
-                    .on_hover_text("Above 0 dBFS — lower output. No limiter.");
-            } else {
-                ui.label(peak_text);
-            }
-            if ui.button("Reset peak").clicked() {
-                self.held_peak = 0.0;
-            }
-        });
-        ui.small("Stereo dry · mono-summed wet · use 100% wet on a send");
-        ui.ctx()
-            .request_repaint_after(std::time::Duration::from_millis(50));
     }
 }
 
@@ -984,12 +1342,14 @@ mod tests {
     }
 
     #[test]
-    fn delay_modulation_opens_and_fits_default_window() {
+    fn difffdn_long_ducking_labels_fit_default_window() {
         assert_editor_contents_fit_default_window(2.0, true);
     }
 
     fn assert_editor_contents_fit_default_window(peak: f32, open_modulation: bool) {
         let mut editor = ReverbEditor {
+            seed_browser: seed_import::Browser::default(),
+            seed_import: Arc::default(),
             params: Arc::new(ReverbParams::default()),
             peak: Arc::new(AtomicU32::new(peak.to_bits())),
             reduction: Arc::new(AtomicU32::new(0)),
@@ -1010,30 +1370,19 @@ mod tests {
                 }
             });
         }
-        let mut header_position = egui::Pos2::ZERO;
         let window_size = egui::vec2(520.0, 800.0);
         for frame in 0..9 {
             let mut bounds = egui::Rect::NOTHING;
             let mut output = ctx.run_ui(
                 egui::RawInput {
                     time: Some(frame as f64 / 60.0),
-                    events: if open_modulation && [1, 2, 5, 6].contains(&frame) {
-                        vec![
-                            egui::Event::PointerMoved(header_position),
-                            egui::Event::PointerButton {
-                                pos: header_position,
-                                button: egui::PointerButton::Primary,
-                                pressed: frame == 1 || frame == 5,
-                                modifiers: egui::Modifiers::NONE,
-                            },
-                        ]
-                    } else {
-                        vec![]
-                    },
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, window_size)),
                     ..Default::default()
                 },
                 |ui| {
+                    ui.data_mut(|data| {
+                        data.insert_temp(egui::Id::unique("test_modulation_open"), open_modulation)
+                    });
                     editor.draw(ui);
                     bounds = ui.min_rect();
                 },
@@ -1056,45 +1405,40 @@ mod tests {
                     _ => None,
                 })
                 .collect();
-            let header = labels
-                .iter()
-                .find(|text| text.galley.job.text == "Delay Modulation")
-                .expect("modulation header must remain visible");
-            header_position = header.pos + header.galley.size() * 0.5;
-            let expanded = open_modulation && (2..6).contains(&frame);
             {
-                assert_eq!(
-                    labels
-                        .iter()
-                        .any(|text| text.galley.job.text == "Mod Depth"),
-                    expanded
-                );
-                assert_eq!(
-                    labels.iter().any(|text| text.galley.job.text == "Mod Rate"),
-                    expanded
-                );
-                for text in labels.iter().filter(|text| {
-                    matches!(
-                        text.galley.job.text.as_str(),
-                        "Delay" | "Mod Depth" | "Mod Rate"
-                    )
-                }) {
-                    let rect = egui::Rect::from_min_size(text.pos, text.galley.size());
+                for hidden in ["Room", "Matrix"] {
+                    assert!(!labels.iter().any(|t| t.galley.job.text == hidden));
+                }
+                for visible in ["Impulse Response", "Browse…", "◀", "▶", "Refresh"] {
                     assert!(
-                        output.shapes.iter().any(|shape| {
-                            matches!(&shape.shape, egui::epaint::Shape::Text(candidate)
-                                if std::ptr::eq(candidate, *text))
-                                && shape.clip_rect.contains_rect(rect)
-                        }),
-                        "modulation controls must be fully visible in the click frame"
+                        labels.iter().any(|t| t.galley.job.text == visible),
+                        "missing {visible}"
                     );
+                }
+                assert!(labels.iter().any(|t| t.galley.job.text == "Damping"));
+                for restored in [
+                    "Delay Modulation",
+                    "T60",
+                    "Diffusion",
+                    "Low Damp",
+                    "Mid Damp",
+                    "High Damp",
+                ] {
+                    assert!(
+                        labels.iter().any(|t| t.galley.job.text == restored),
+                        "missing {restored}"
+                    );
+                }
+                if open_modulation {
+                    for name in ["Mod Depth", "Mod Rate"] {
+                        assert!(
+                            labels.iter().any(|t| t.galley.job.text == name),
+                            "missing {name}"
+                        );
+                    }
                 }
             }
             assert!(bounds.right() <= window_size.x, "{bounds:?}");
-            if expanded {
-                // The lower controls may be clipped until modulation is closed.
-                continue;
-            }
             let peak_label = output
                 .shapes
                 .iter()
@@ -1304,6 +1648,190 @@ mod tests {
             });
         }
         engine.process(&mut buffer, params, sidechain);
+    }
+
+    #[test]
+    fn wet_output_is_independent_protected_and_does_not_change_main() {
+        fn render(wet: f32, bypass: bool, output_db: f32, attached: bool) -> [Vec<f32>; 4] {
+            let p = ReverbParams::default();
+            set(&p.wet, wet);
+            set(&p.bypass, bypass);
+            set(&p.output_db, output_db);
+            set(&p.space_enabled, true);
+            set(&p.repeat_enabled, true);
+            set(&p.repeat_nudge, -5.);
+            let mut engine = PluginEngine::new(8000., &p).unwrap();
+            let mut left: Vec<f32> = (0..8000)
+                .map(|i| {
+                    if i < 300 {
+                        (i as f32 * 0.21).sin() * 0.1
+                    } else {
+                        0.
+                    }
+                })
+                .collect();
+            let mut right = left.clone();
+            let mut wl = vec![123.; left.len()];
+            let mut wr = wl.clone();
+            let mut main = Buffer::default();
+            let mut aux = Buffer::default();
+            unsafe {
+                main.set_slices(left.len(), |s| {
+                    s.push(&mut left);
+                    s.push(&mut right);
+                });
+                aux.set_slices(wl.len(), |s| {
+                    s.push(&mut wl);
+                    s.push(&mut wr);
+                });
+            }
+            engine.process_with_wet_output(&mut main, &p, None, attached.then_some(&mut aux));
+            [left, right, wl, wr]
+        }
+        let dry = render(0., false, 0., true);
+        let wet = render(1., false, 0., true);
+        let no_aux = render(0., false, 0., false);
+        assert_eq!(&dry[..2], &no_aux[..2]);
+        assert_eq!(&dry[2..], &wet[2..]);
+        assert_eq!(&wet[..2], &wet[2..]); // Same processing order at 100% Wet.
+        assert!(dry[2].iter().any(|v| v.abs() > 1e-6));
+        let boosted = render(0., false, 6., true);
+        for (a, b) in dry[2].iter().zip(&boosted[2]) {
+            assert!((b - a * util::db_to_gain(6.)).abs() < 1e-6);
+        }
+        let bypass = render(0.5, true, 0., true);
+        assert!(bypass[2..].iter().flatten().all(|v| *v == 0.));
+        let hot = render(0., false, 6., true);
+        assert!(
+            hot[2..]
+                .iter()
+                .flatten()
+                .all(|v| v.is_finite() && v.abs() <= live_limiter::CEILING + 1e-6)
+        );
+        assert_eq!(
+            AlgoReverb::AUDIO_IO_LAYOUTS[0].aux_output_ports,
+            &[new_nonzero_u32(2)]
+        );
+        assert_eq!(
+            AlgoReverb::AUDIO_IO_LAYOUTS[0].names.aux_outputs,
+            &["Wet Out"]
+        );
+    }
+
+    #[test]
+    fn slice_repeat_modes_are_distinct_block_independent_limited_and_resettable() {
+        let mut outputs = Vec::new();
+        for mode in [slice_repeat::Mode::Space, slice_repeat::Mode::Input] {
+            let params = ReverbParams::default();
+            set(&params.space_enabled, true);
+            set(&params.repeat_enabled, true);
+            set(&params.repeat_mode, mode);
+            set(&params.repeat_feedback, 0.95);
+            set(&params.repeat_nudge, -5.25);
+            set(&params.wet, 1.);
+            let mut a = PluginEngine::new(8000., &params).unwrap();
+            let mut b = PluginEngine::new(8000., &params).unwrap();
+            let source: Vec<f32> = (0..24000)
+                .map(|i| {
+                    if i % 4000 < 700 {
+                        (i as f32 * 0.21).sin() * 0.8
+                    } else {
+                        0.
+                    }
+                })
+                .collect();
+            let mut left = source.clone();
+            let mut right = source.clone();
+            let mut bl = source.clone();
+            let mut br = source;
+            process(&mut a, &params, &mut left, &mut right);
+            for (l, r) in bl.chunks_mut(37).zip(br.chunks_mut(37)) {
+                process(&mut b, &params, l, r);
+            }
+            assert_eq!(left, bl);
+            assert_eq!(right, br);
+            assert!(left.iter().any(|x| x.abs() > 1e-5));
+            assert!(
+                left.iter()
+                    .chain(&right)
+                    .all(|x| x.is_finite() && x.abs() <= live_limiter::CEILING + 1e-6)
+            );
+            a.reset(&params);
+            let mut l = [0.; 4096];
+            let mut r = l;
+            process(&mut a, &params, &mut l, &mut r);
+            assert_eq!(l, [0.; 4096]);
+            outputs.push(left);
+        }
+        assert!(
+            outputs[0]
+                .iter()
+                .zip(&outputs[1])
+                .map(|(a, b)| (a - b).abs())
+                .sum::<f32>()
+                > 0.1
+        );
+    }
+
+    #[test]
+    fn disabled_slice_repeat_preserves_audio_and_parameter_defaults() {
+        let a = ReverbParams::default();
+        let b = ReverbParams::default();
+        assert!(!a.repeat_enabled.value());
+        assert_eq!(a.repeat_division.value(), slice_repeat::Division::Eighth);
+        assert_eq!(a.repeat_mode.value(), slice_repeat::Mode::Space);
+        set(&b.repeat_enabled, true); // Peak Space is still OFF.
+        set(&b.repeat_mode, slice_repeat::Mode::Input);
+        let mut ea = PluginEngine::new(8000., &a).unwrap();
+        let mut eb = PluginEngine::new(8000., &b).unwrap();
+        let mut al: Vec<f32> = (0..8000).map(|i| (i as f32 * 0.23).sin() * 0.2).collect();
+        let mut ar = al.clone();
+        let mut bl = al.clone();
+        let mut br = al.clone();
+        process(&mut ea, &a, &mut al, &mut ar);
+        process(&mut eb, &b, &mut bl, &mut br);
+        assert_eq!((al, ar), (bl, br));
+    }
+
+    #[test]
+    fn peak_space_plugin_is_block_independent_and_limited() {
+        for steps in [0., 1., 4., 8.] {
+            check_peak_space_blocks(steps);
+        }
+    }
+
+    fn check_peak_space_blocks(steps: f32) {
+        let params = ReverbParams::default();
+        assert!(!params.space_enabled.value());
+        assert_eq!(params.space_steps.value(), 0.);
+        assert_eq!(params.space_steps.to_string(), "Smooth");
+        set(&params.space_steps, steps);
+        set(&params.space_enabled, true);
+        set(&params.wet, 1.);
+        let mut a = PluginEngine::new(8000., &params).unwrap();
+        let mut b = PluginEngine::new(8000., &params).unwrap();
+        let mut left: Vec<f32> = (0..16000)
+            .map(|i| if i % 800 == 0 { 2. } else { 0. })
+            .collect();
+        let mut right = left.clone();
+        let mut bl = left.clone();
+        let mut br = right.clone();
+        process(&mut a, &params, &mut left, &mut right);
+        for (l, r) in bl.chunks_mut(37).zip(br.chunks_mut(37)) {
+            process(&mut b, &params, l, r);
+        }
+        assert_eq!(left, bl);
+        assert_eq!(right, br);
+        assert!(left.iter().any(|x| x.abs() > 1e-6));
+        assert!(
+            left.iter()
+                .chain(&right)
+                .all(|x| x.is_finite() && x.abs() <= 0.892)
+        );
+        a.reset(&params);
+        let (mut l, mut r) = ([0.; 1000], [0.; 1000]);
+        process(&mut a, &params, &mut l, &mut r);
+        assert!(l.iter().chain(&r).all(|&x| x == 0.));
     }
 
     #[test]
@@ -1566,28 +2094,248 @@ mod tests {
     }
 
     #[test]
-    fn default_engine_matches_classic_after_reset() {
+    fn default_engine_matches_difffdn_after_reset() {
         let params = ReverbParams::default();
         let mut engine = PluginEngine::new(48_000.0, &params).unwrap();
         for _ in 0..2 {
-            engine.update(&params);
-            assert_eq!(params.t60.value(), 2.5);
-            assert_eq!(params.damping.value(), 6000.0);
             engine.reset(&params);
-            let mut reference = Reverb::new(Config {
-                matrix: Matrix::Hybrid,
-                ..Config::default()
-            })
-            .unwrap();
+            let mut reference = DiffFdn::parse(room_text(RoomPreset::Salon)).unwrap();
+            reference.enable_live_controls();
+            apply_live_controls(&mut reference, &params);
             reference.reset();
-            for i in 0..4096 {
+            for i in 0..48000 {
                 let input = if i == 0 { 1.0 } else { 0.0 };
+                let wet = engine.reverb.process(input, RoomPreset::Salon);
                 assert_eq!(
-                    engine.reverb.process_sample(input),
-                    reference.process_sample(input)
+                    wet,
+                    [(DIFFFDN_WET_GAINS[0] * reference.process_sample(input as f64)) as f32; 2]
                 );
             }
         }
+    }
+
+    #[test]
+    fn difffdn_single_room_matches_continuously_running_reference() {
+        for room in [RoomPreset::Salon, RoomPreset::Damped] {
+            let params = ReverbParams::default();
+            set(&params.room, room);
+            let mut engine = PluginEngine::new(48000.0, &params).unwrap();
+            let mut reference = PluginEngine::new(48000.0, &params).unwrap();
+            let index = usize::from(room == RoomPreset::Damped);
+            for i in 0..48000 {
+                if i == 12000 {
+                    set(&params.extra_damping, 0.7);
+                    set(&params.mod_depth, 0.8);
+                    set(&params.delay_mode, DelayReadMode::RandomAllpass);
+                    engine.update(&params);
+                    reference.update(&params);
+                }
+                let input = (i as f32 * 0.031).sin() * 0.1;
+                let both: [f64; 2] =
+                    std::array::from_fn(|j| reference.reverb.rooms[j].process_sample(input as f64));
+                assert_eq!(
+                    engine.reverb.process(input, room),
+                    [(both[index] * DIFFFDN_WET_GAINS[index]) as f32; 2]
+                );
+            }
+            // The unselected room has received no input and has no hidden tail.
+            for _ in 0..12000 {
+                assert_eq!(engine.reverb.rooms[1 - index].process_sample(0.0), 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn difffdn_room_fade_reverses_continuously_and_clears_stopped_tail() {
+        let params = ReverbParams::default();
+        let mut engine = PluginEngine::new(48000.0, &params).unwrap();
+        let mut reference = PluginEngine::new(48000.0, &params).unwrap();
+        let n = engine.reverb.transition_samples;
+        let mut position = 0_u32;
+        for i in 0..24000 {
+            let room = if i < 1000 || (i >= 2000 && i < 2500) {
+                RoomPreset::Salon
+            } else {
+                RoomPreset::Damped
+            };
+            let target = if room == RoomPreset::Salon { 0 } else { n };
+            let before = position;
+            position = if position < target {
+                position + 1
+            } else if position > target {
+                position - 1
+            } else {
+                position
+            };
+            let blend = position as f64 / n as f64;
+            let input = (i as f32 * 0.031).sin() * 0.1;
+            let a = reference.reverb.rooms[0].process_sample(input as f64);
+            let b = reference.reverb.rooms[1].process_sample(input as f64);
+            let actual = engine.reverb.process(input, room)[0];
+            // Destination is cold until the first switch. Before it is audible,
+            // the warm reference must be reset to that same initial state.
+            if i < 1000 {
+                reference.reverb.rooms[1].reset();
+            }
+            let expected = if position == n {
+                (b * DIFFFDN_WET_GAINS[1]) as f32
+            } else {
+                ((1.0 - blend) * DIFFFDN_WET_GAINS[0] * a + blend * DIFFFDN_WET_GAINS[1] * b) as f32
+            };
+            assert!((actual - expected).abs() < 1e-7);
+            assert!(position.abs_diff(before) <= 1);
+            assert_eq!(engine.reverb.position, position);
+        }
+        assert_eq!(position, n);
+        for _ in 0..12000 {
+            assert_eq!(engine.reverb.rooms[0].process_sample(0.0), 0.0);
+        }
+        // Inactive parameter changes apply before the room is resumed.
+        set(&params.extra_damping, 0.8);
+        set(&params.matrix, MatrixMode::Hadamard);
+        engine.update(&params);
+        for _ in 0..n {
+            assert!(engine.reverb.process(0.0, RoomPreset::Salon)[0].is_finite());
+        }
+        assert_eq!(engine.reverb.process(0.0, RoomPreset::Salon), [0.0; 2]);
+        engine.reverb.reset(RoomPreset::Damped);
+        assert_eq!(engine.reverb.position, n);
+        assert_eq!(engine.reverb.process(0.0, RoomPreset::Damped), [0.0; 2]);
+    }
+
+    #[test]
+    fn difffdn_rapid_room_automation_preserves_safety_ceiling() {
+        let params = ReverbParams::default();
+        set(&params.wet, 0.7);
+        set(&params.output_db, 6.0);
+        let mut engine = PluginEngine::new(48000.0, &params).unwrap();
+        for block in 0..800 {
+            set(
+                &params.room,
+                if (block / 80) % 2 == 0 || block % 7 == 0 {
+                    RoomPreset::Salon
+                } else {
+                    RoomPreset::Damped
+                },
+            );
+            let mut left = [2.0; 128];
+            let mut right = [1.5; 128];
+            process(&mut engine, &params, &mut left, &mut right);
+            assert!(
+                left.iter()
+                    .chain(&right)
+                    .all(|x| x.is_finite() && x.abs() <= live_limiter::CEILING + 1e-6)
+            );
+        }
+    }
+
+    #[test]
+    fn difffdn_parameter_snapshot_restore_matches_fresh_engine() {
+        let saved = ReverbParams::default();
+        set(&saved.room, RoomPreset::Damped);
+        set(&saved.extra_damping, 0.73);
+        set(&saved.wet, 0.61);
+        set(&saved.output_db, -8.0);
+        // Exercise the same public parameter pointers used by the host wrapper.
+        // This is a parameter/state-field roundtrip, not a DAW chunk-format test.
+        let snapshot: Vec<_> = saved
+            .param_map()
+            .into_iter()
+            .map(|(id, ptr, _)| (id, unsafe { ptr.unmodulated_normalized_value() }))
+            .collect();
+        let restored = ReverbParams::default();
+        for (id, ptr, _) in restored.param_map() {
+            let value = snapshot.iter().find(|(key, _)| key == &id).unwrap().1;
+            unsafe {
+                ptr._internal_set_normalized_value(value);
+            }
+        }
+        restored.deserialize_fields(&saved.serialize_fields());
+        assert_eq!(restored.room.value(), RoomPreset::Damped);
+        assert_eq!(restored.extra_damping.value(), saved.extra_damping.value());
+        for rate in [44100.0, 48000.0, 96000.0] {
+            let mut a = PluginEngine::new(rate, &saved).unwrap();
+            let mut b = PluginEngine::new(rate, &restored).unwrap();
+            for _ in 0..2 {
+                let mut al = [0.0; 4096];
+                let mut ar = al;
+                al[0] = 0.5;
+                let mut bl = al;
+                let mut br = ar;
+                process(&mut a, &saved, &mut al, &mut ar);
+                process(&mut b, &restored, &mut bl, &mut br);
+                assert_eq!((al, ar), (bl, br));
+                a.reset(&saved);
+                b.reset(&restored);
+            }
+        }
+        for (id, ptr, _) in restored.param_map() {
+            let flags = unsafe { ptr.flags() };
+            if [
+                "matrix",
+                "diffusion",
+                "t60",
+                "damping",
+                "damping_low",
+                "damping_mid",
+                "loop_diffusion",
+                "delay_mode",
+                "mod_depth",
+                "mod_rate",
+                "damping_low_hz",
+                "damping_mid_hz",
+                "damping_mid_q",
+            ]
+            .contains(&id.as_str())
+            {
+                assert!(!flags.contains(ParamFlags::HIDDEN));
+            }
+        }
+    }
+
+    #[test]
+    fn custom_seed_plugin_is_stereo_limited_and_restores_without_wav() {
+        let saved = ReverbParams::default();
+        let mut text = String::from("rust-stereo-seed-v1");
+        for x in [1.0; 7]
+            .into_iter()
+            .chain([0.0; 7])
+            .chain([0.35; 8])
+            .chain([0.35, -0.35, 0.35, -0.35, 0.35, -0.35, 0.35, -0.35])
+        {
+            text.push_str(&format!(" {x}"));
+        }
+        *saved.seed_state.lock().unwrap() = ("missing-source.wav".into(), text);
+        set(&saved.seed_enabled, true);
+        set(&saved.wet, 1.0);
+        set(&saved.output_db, 6.0);
+        let restored = ReverbParams::default();
+        restored.deserialize_fields(&saved.serialize_fields());
+        set(&restored.seed_enabled, true);
+        set(&restored.wet, 1.0);
+        set(&restored.output_db, 6.0);
+        let mut a = PluginEngine::new(48000.0, &saved).unwrap();
+        let mut b = PluginEngine::new(48000.0, &restored).unwrap();
+        let mut difference = 0.0;
+        for block in 0..400 {
+            let mut al = [0.0; 128];
+            for (i, x) in al.iter_mut().enumerate() {
+                *x = ((block * 128 + i) as f32 * 0.172).sin() * 3.0;
+            }
+            let mut ar = al;
+            let mut bl = al;
+            let mut br = ar;
+            process(&mut a, &saved, &mut al, &mut ar);
+            process(&mut b, &restored, &mut bl, &mut br);
+            assert_eq!((al, ar), (bl, br));
+            for i in 0..128 {
+                assert!(al[i].is_finite() && ar[i].is_finite());
+                assert!(al[i].abs().max(ar[i].abs()) <= live_limiter::CEILING + 1e-6);
+                difference += (al[i] - ar[i]).abs();
+            }
+        }
+        assert!(difference > 1.0);
+        assert_eq!(a.seed.advance(true), 1.0);
     }
 
     #[test]
@@ -1623,7 +2371,24 @@ mod tests {
                 "damping_low_hz",
                 "damping_mid_hz",
                 "damping_mid_q",
-                "duck_detection"
+                "duck_detection",
+                "difffdn_room",
+                "difffdn_damping",
+                "seed_enabled",
+                "space_enabled",
+                "space_threshold",
+                "space_decay",
+                "space_swell",
+                "space_release",
+                "space_steps",
+                "repeat_enabled",
+                "repeat_mode",
+                "repeat_division",
+                "repeat_nudge",
+                "repeat_feedback",
+                "repeat_mix",
+                "repeat_high_cut",
+                "repeat_high_pass"
             ]
         );
         assert!(params.matrix.value() == MatrixMode::Hybrid);
@@ -1655,7 +2420,7 @@ mod tests {
     }
 
     #[test]
-    fn plugin_dry_and_bypass_preserve_stereo_without_clamping() {
+    fn plugin_dry_is_protected_but_bypass_preserves_unity_stereo() {
         for bypass in [false, true] {
             let params = ReverbParams::default();
             set(&params.wet, 0.0);
@@ -1668,12 +2433,287 @@ mod tests {
             let mut right = [-0.25, 0.75, -1.5];
             let expected = (left, right);
             process(&mut engine, &params, &mut left, &mut right);
-            assert_eq!((left, right), expected);
+            if bypass {
+                assert_eq!((left, right), expected);
+            } else {
+                for i in 0..left.len() {
+                    assert!(left[i].abs().max(right[i].abs()) <= live_limiter::CEILING + 1e-6);
+                    assert!((left[i] * expected.1[i] - right[i] * expected.0[i]).abs() < 1e-6);
+                }
+            }
         }
     }
 
     #[test]
-    fn plugin_wet_impulse_is_stereo_and_reset_is_reproducible() {
+    fn classic_controls_change_the_difffdn_response() {
+        let render = |p: &ReverbParams| {
+            let mut engine = PluginEngine::new(48000.0, p).unwrap();
+            (0..24000)
+                .map(|i| {
+                    engine
+                        .reverb
+                        .process(if i == 0 { 1.0 } else { 0.0 }, p.room.value())[0]
+                })
+                .collect::<Vec<_>>()
+        };
+        let baseline = render(&ReverbParams::default());
+        for control in [
+            "t60",
+            "damping",
+            "diffusion",
+            "loop_diffusion",
+            "damping_low",
+            "damping_mid",
+            "damping_low_hz",
+            "damping_mid_hz",
+            "damping_mid_q",
+            "delay_mode",
+            "mod_depth",
+            "mod_rate",
+            "matrix",
+        ] {
+            let p = ReverbParams::default();
+            // Shape knobs need nonzero band loss; modulation knobs need an active mode.
+            if control.starts_with("damping_") {
+                set(&p.damping_low, 8.0);
+                set(&p.damping_mid, 8.0);
+            }
+            if control.starts_with("mod_") {
+                set(&p.delay_mode, DelayReadMode::RandomLinear);
+            }
+            let reference = if control.starts_with("damping_") || control.starts_with("mod_") {
+                render(&p)
+            } else {
+                baseline.clone()
+            };
+            match control {
+                "t60" => set(&p.t60, 0.15),
+                "damping" => set(&p.damping, 300.0),
+                "diffusion" => set(&p.diffusion, 1.0),
+                "loop_diffusion" => set(&p.loop_diffusion, 1.0),
+                "damping_low" => set(&p.damping_low, 24.0),
+                "damping_mid" => set(&p.damping_mid, 24.0),
+                "damping_low_hz" => set(&p.damping_low_hz, 1500.0),
+                "damping_mid_hz" => set(&p.damping_mid_hz, 3000.0),
+                "damping_mid_q" => set(&p.damping_mid_q, 4.0),
+                "delay_mode" => set(&p.delay_mode, DelayReadMode::RandomAllpass),
+                "mod_depth" => set(&p.mod_depth, 1.0),
+                "mod_rate" => set(&p.mod_rate, 2.0),
+                "matrix" => set(&p.matrix, MatrixMode::Hadamard),
+                _ => unreachable!(),
+            }
+            let changed = render(&p);
+            let difference: f64 = changed
+                .iter()
+                .zip(&reference)
+                .map(|(a, b)| f64::from(a - b).powi(2))
+                .sum();
+            assert!(difference > 1e-12, "inert control: {control}, {difference}");
+        }
+    }
+
+    #[test]
+    #[ignore = "manual release-mode CPU measurement, not a timing assertion"]
+    fn difffdn_cpu_measurement() {
+        for mode in [DelayReadMode::Static, DelayReadMode::RandomAllpass] {
+            let p = ReverbParams::default();
+            set(&p.delay_mode, mode);
+            let mut engine = PluginEngine::new(48000.0, &p).unwrap();
+            let mut input = [0.0_f32; 128];
+            for (i, x) in input.iter_mut().enumerate() {
+                *x = (i as f32 * 0.13).sin() * 0.1;
+            }
+            for _ in 0..375 {
+                let mut left = input;
+                let mut right = input;
+                process(&mut engine, &p, &mut left, &mut right);
+            }
+            let start = std::time::Instant::now();
+            let mut checksum = 0.0_f64;
+            for _ in 0..3750 {
+                let mut left = input;
+                let mut right = input;
+                process(&mut engine, &p, &mut left, &mut right);
+                checksum += f64::from(std::hint::black_box(left[127]));
+            }
+            eprintln!(
+                "CPU static={}: 10 s audio / {:?} processing; checksum={checksum:.12}",
+                mode == DelayReadMode::Static,
+                start.elapsed()
+            );
+        }
+    }
+
+    #[test]
+    fn difffdn_leveled_mix_preserves_power_and_exact_endpoints() {
+        for (gain, db) in DIFFFDN_WET_GAINS.into_iter().zip([-25.4, -21.5]) {
+            assert!((20.0 * gain.log10() - db).abs() < 1e-10);
+        }
+        assert_eq!(difffdn_mix_gains(0.0), (1.0, 0.0));
+        assert_eq!(difffdn_mix_gains(1.0), (0.0, 1.0));
+        for i in 0..=100 {
+            let (dry, wet) = difffdn_mix_gains(i as f32 / 100.0);
+            assert!((dry * dry + wet * wet - 1.0).abs() < 2e-7);
+        }
+        let params = ReverbParams::default();
+        set(&params.wet, 0.0);
+        set(&params.output_db, 0.0);
+        let mut engine = PluginEngine::new(48000.0, &params).unwrap();
+        let mut left = [0.125; 512];
+        let mut right = [-0.25; 512];
+        process(&mut engine, &params, &mut left, &mut right);
+        assert_eq!(left, [0.125; 512]);
+        assert_eq!(right, [-0.25; 512]);
+    }
+
+    #[test]
+    fn difffdn_bypass_relative_level_measurement() {
+        let rate = 48000;
+        // Log-spaced equal-amplitude tones approximate equal power per octave.
+        // Keep peaks low so the safety limiter does not hide the linear gain.
+        let input: Vec<f32> = (0..rate * 6)
+            .map(|i| {
+                (0..48)
+                    .map(|band| {
+                        let hz = 30.0 * (16000.0_f64 / 30.0).powf(band as f64 / 47.0);
+                        let phase = band as f64 * (band + 1) as f64 * 0.37;
+                        (std::f64::consts::TAU * hz * i as f64 / rate as f64 + phase).sin()
+                    })
+                    .sum::<f64>() as f32
+                    * 0.002
+            })
+            .collect();
+        let power = |samples: &[f32]| {
+            samples[rate * 2..]
+                .iter()
+                .map(|&x| f64::from(x).powi(2))
+                .sum::<f64>()
+        };
+        let dry_power = power(&input);
+        for room in [RoomPreset::Salon, RoomPreset::Damped] {
+            for wet in [0.0, 0.35, 0.7, 1.0] {
+                for output_db in [0.0, 6.0] {
+                    let params = ReverbParams::default();
+                    set(&params.room, room);
+                    set(&params.wet, wet);
+                    set(&params.output_db, output_db);
+                    let mut engine = PluginEngine::new(rate as f32, &params).unwrap();
+                    let mut left = input.clone();
+                    let mut right = input.clone();
+                    process(&mut engine, &params, &mut left, &mut right);
+                    assert_eq!(left, right);
+                    assert!(left.iter().all(|x| x.is_finite()));
+                    let db = 10.0 * (power(&left) / dry_power).log10();
+                    let peak = left.iter().fold(0.0_f32, |a, x| a.max(x.abs()));
+                    eprintln!(
+                        "{room:?}: wet={wet:.2}, output={output_db:+.0} dB, bypass-relative RMS={db:+.2} dB, peak={peak:.4}"
+                    );
+                    if wet == 0.0 {
+                        assert!((db - f64::from(output_db)).abs() < 0.001);
+                    } else {
+                        assert!(
+                            (db - f64::from(output_db)).abs() < 1.0,
+                            "{room:?}: wet={wet}, output={output_db}, relative RMS={db}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "manual hot-input limiter diagnostic"]
+    fn difffdn_hot_input_level_measurement() {
+        for room in [RoomPreset::Salon, RoomPreset::Damped] {
+            for amplitude in [0.1, 1.0, 2.0] {
+                let params = ReverbParams::default();
+                set(&params.room, room);
+                set(&params.output_db, 6.0);
+                let mut engine = PluginEngine::new(48000.0, &params).unwrap();
+                let input: Vec<f32> = (0..96000)
+                    .map(|i| amplitude * (std::f32::consts::TAU * 997.0 * i as f32 / 48000.0).sin())
+                    .collect();
+                let mut left = input.clone();
+                let mut right = input.clone();
+                process(&mut engine, &params, &mut left, &mut right);
+                let power = |x: &[f32]| {
+                    x[48000..]
+                        .iter()
+                        .map(|&s| f64::from(s).powi(2))
+                        .sum::<f64>()
+                };
+                eprintln!(
+                    "{room:?}: input peak={amplitude}, wet=0.35, output=+6 dB, bypass-relative RMS={:+.2} dB, final limiter reduction={:.2} dB",
+                    10.0 * (power(&left) / power(&input)).log10(),
+                    -20.0 * engine.limiter.gain().log10()
+                );
+                assert!(
+                    left.iter()
+                        .all(|x| x.is_finite() && x.abs() <= live_limiter::CEILING + 1e-6)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn difffdn_headroom_for_impulses_and_sustained_signals() {
+        for rate in [8000, 44100, 48000, 96000, 192000, 384000] {
+            for room in [RoomPreset::Salon, RoomPreset::Damped] {
+                let p = ReverbParams::default();
+                set(&p.room, room);
+                set(&p.wet, 1.0);
+                let mut engine = PluginEngine::new(rate as f32, &p).unwrap();
+                let mut peak = 0.0_f32;
+                let mut energy = 0.0_f64;
+                for i in 0..rate * 2 {
+                    let t = i as f64 / rate as f64;
+                    // Impulse, DC, low tone, swept tone, then tail.
+                    let input = if i == 0 {
+                        1.0
+                    } else if t < 0.25 {
+                        0.0
+                    } else if t < 0.5 {
+                        0.5
+                    } else if t < 0.75 {
+                        (std::f64::consts::TAU * 80.0 * t).sin() as f32 * 0.5
+                    } else if t < 1.5 {
+                        (std::f64::consts::TAU
+                            * (100.0 * t + 0.15 * rate as f64 * (t - 0.75).powi(2)))
+                        .sin() as f32
+                            * 0.5
+                    } else {
+                        0.0
+                    };
+                    let wet = engine.reverb.process(input, room)[0];
+                    assert!(wet.is_finite());
+                    peak = peak.max(wet.abs());
+                    energy += f64::from(wet).powi(2);
+                }
+                eprintln!(
+                    "headroom: {rate} {room:?}: wet peak {peak:.6} ({:.2} dBFS), RMS {:.2} dBFS",
+                    20.0 * peak.log10(),
+                    10.0 * (energy / f64::from(rate * 2)).log10()
+                );
+                assert!(
+                    peak < 0.8
+                        * DIFFFDN_WET_GAINS[if room == RoomPreset::Salon { 0 } else { 1 }] as f32
+                        / 0.025_118_864,
+                    "{rate} {room:?}: excessive pre-limiter wet peak {peak}"
+                );
+                let mut left = [20.0; 512];
+                let mut right = left;
+                process(&mut engine, &p, &mut left, &mut right);
+                assert!(
+                    left.iter()
+                        .chain(&right)
+                        .all(|x| x.is_finite() && x.abs() <= live_limiter::CEILING + 1e-6)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plugin_wet_impulse_is_dual_mono_and_reset_is_reproducible() {
         let params = ReverbParams::default();
         set(&params.delay_mode, DelayReadMode::RandomAllpass);
         set(&params.loop_diffusion, 0.8);
@@ -1692,7 +2732,7 @@ mod tests {
         let first = render(&mut engine);
         assert_eq!(first.0[0], 0.0);
         assert!(first.0.iter().any(|x| x.abs() > 1e-5));
-        assert_ne!(first.0, first.1);
+        assert_eq!(first.0, first.1);
         engine.reset(&params);
         assert_eq!(render(&mut engine), first);
     }
@@ -1721,6 +2761,15 @@ mod tests {
         for rate in [8000.0, 44100.0, 48000.0, 96000.0, 192000.0, 384000.0] {
             let mut engine = PluginEngine::new(rate, &params).unwrap();
             for i in 0..100 {
+                set(
+                    &params.room,
+                    if i % 2 == 0 {
+                        RoomPreset::Salon
+                    } else {
+                        RoomPreset::Damped
+                    },
+                );
+                set(&params.extra_damping, (i % 2) as f32);
                 set(&params.matrix, MatrixMode::from_index(i % 3));
                 set(&params.damping, if i % 2 == 0 { 20000.0 } else { 100.0 });
                 set(&params.damping_low, if i % 2 == 0 { 24.0 } else { 0.0 });
@@ -1772,7 +2821,7 @@ mod tests {
                         .chain(&right)
                         .all(|x| x.is_finite() && x.abs() < 4.0)
                 );
-                assert!(engine.targets.damping <= rate * 0.5);
+                assert_eq!(engine.reverb.rooms[0].sample_rate(), rate as u32);
                 assert!((0.0..=36.0).contains(&engine.duck_reduction));
             }
         }
